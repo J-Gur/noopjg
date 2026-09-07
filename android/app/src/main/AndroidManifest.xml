@@ -96,6 +96,12 @@
     <!-- Health Connect (optional): read-only access to the user's own health data so it can
          be imported on-device. Nothing is uploaded. Granted at runtime, revocable any time. -->
     <uses-permission android:name="android.permission.health.READ_STEPS" />
+    <!-- DistanceRecord is bundled into the ACTIVITY import category alongside Steps
+         (HealthConnectImporter.ImportCategory.ACTIVITY), so selecting Activity to import Steps
+         batches this permission into the same runtime request. MUST be declared or Health Connect
+         silently drops the WHOLE request (same trap as #412 / READ_HYDRATION above) — with this
+         missing, tapping "Import from Health Connect" showed no permission dialog and no Toast at all. -->
+    <uses-permission android:name="android.permission.health.READ_DISTANCE" />
     <uses-permission android:name="android.permission.health.READ_TOTAL_CALORIES_BURNED" />
     <uses-permission android:name="android.permission.health.READ_ACTIVE_CALORIES_BURNED" />
     <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
