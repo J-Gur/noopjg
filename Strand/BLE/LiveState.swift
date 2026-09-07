@@ -24,6 +24,14 @@ public final class LiveState: ObservableObject {
     /// connect/disconnect. Drives the Live pill's two-state distinction; the encrypted channel (buzz,
     /// alarm, double-tap, history offload) only works when this is true.
     @Published public var encryptedBond: Bool = false
+    /// True once this strap can actually hand over history — the UI mirror of `BLEManager`'s
+    /// `connectHandshakeDone`, which `beginBackfill` already requires before it will request an offload.
+    ///
+    /// Exposed because `bonded` is NOT that condition and reads true too early: the live-HR path sets it
+    /// for a 5/MG that has never completed a handshake, so the sync controls were offered, accepted, and
+    /// then refused deeper down in silence. Gating on this makes them unavailable exactly when the sync
+    /// would have been declined anyway — never when it would have run. Kotlin twin: `LiveState.historyReady`.
+    @Published public var historyReady: Bool = false
     /// #34: bumped by BLEManager once a WHOOP 4.0 connection has BOTH run its connect handshake (hello +
     /// SET_CLOCK, exactly once — `connectHandshakeDone`) AND had the cmd-notify characteristic confirm
     /// subscribed (`didUpdateNotificationStateFor` for it fired with `isNotifying == true`) — whichever of
@@ -68,10 +76,38 @@ public final class LiveState: ObservableObject {
     /// GET_EXTENDED_BATTERY_INFO response (#592). Shown on the Devices card as a "x.xx V" readout beside the
     /// percent; nil until the first battery event lands. Twin of the Android LiveState.batteryMv.
     @Published public var batteryMv: Int? = nil
-    /// Charging flag from the strap's BATTERY_LEVEL events — wire observation: u8 bit0 in the
-    /// event payload (4.0 @26 / 5.0 @30), pushed ~every 8 min on captured links. nil until the
-    /// first event of a session; cleared on disconnect so a stale flag can't outlive the link.
-    /// Flag ONLY — the battery % keeps its family-specific source (#77).
+    /// Charging flag. Two sources, and they mean different things (#1935).
+    ///
+    /// The authority is the strap's BATTERY_LEVEL event — wire observation: u8 bit0 in the payload
+    /// (4.0 @26 / 5.0 @30), pushed ~every 8 min on captured links. That is a LEVEL signal from the
+    /// strap's own gauge: every live battery event rewrites this flag, whatever it was.
+    ///
+    /// On a 5/MG it is ALSO set by `BATTERY_PACK_CONNECTED(21)` and cleared by
+    /// `BATTERY_PACK_REMOVED(22)`, which is a latency win — 21 leads `CHARGING_ON(7)` by up to ~17 s in
+    /// captures, so the pill responds when the pack goes on. But 21 means A PACK WAS ATTACHED, not that
+    /// charging began. They diverge on a depleted pack or a poor contact: 21 fires, 7 never does, and
+    /// this reads true while nothing charges.
+    ///
+    /// THAT STATE IS BOUNDED, which is why it is documented rather than split. It does not last until 22:
+    /// the next live BATTERY_LEVEL overwrites it from the strap's own GAUGE, so the window is about one
+    /// battery cadence, and the gauge always gets the last word.
+    ///
+    /// It gets the last word only because nothing else repeats, which is a real constraint rather than an
+    /// observation (#1935). The pack record reaches this platform LOG-ONLY (`FrameRouter`, Test Centre
+    /// gated) and writes nothing here. Android learned the same rule the hard way: its pushed pack-info
+    /// event (109) once wrote `charging = true` on pack PRESENCE every couple of minutes, outran the
+    /// gauge, and held a flat pack at "charging" for its whole attachment. An EDGE may set this flag
+    /// (7, 21, 22); a repeating presence signal must not, or the gauge cannot correct it.
+    ///
+    /// It matters beyond the pill. `BLEManager.lowPowerThrottleActive` reads it and gates THREE levers, not
+    /// one: the low-battery offload cadence, the connection-priority throttle, and the continuous-capture
+    /// pause behind the user's own "Pause HRV capture" percentage. So a pack attached but not charging can
+    /// keep background capture running at low battery after the user asked for it to stop, for that
+    /// window. `BLEManager.batteryPollDue` also reads it, polling every tick instead of every
+    /// other, which is harmless and arguably wanted with a pack on.
+    ///
+    /// nil until the first event of a session; cleared on disconnect so a stale flag can't outlive the
+    /// link. Flag ONLY — the battery % keeps its family-specific source (#77).
     @Published public var charging: Bool? = nil
 
     /// The Oura ring's current wear/charge state (nil for non-Oura straps or before any evidence this
@@ -363,16 +399,26 @@ public final class LiveState: ObservableObject {
     /// card, so the two can't disagree the way they did in #266 (sidebar "Connecting…" vs Settings
     /// "Connected" for the same connected-but-unbonded 5/MG link). Once the link is up and HR is
     /// flowing — even over the unbonded standard profile — this reads "Connected", never "Connecting…".
+    ///
+    /// "Bonded" means [encryptedBond], never [bonded]. The 5/MG live-HR shortcut (#69) sets `bonded` while
+    /// HR streams over the OPEN profile with no pairing at all, so keying the green bonded state off it
+    /// told a strap with no encrypted pairing that it had one — and the encrypted bond is exactly what
+    /// gates buzz, alarms, double-tap and history sync. LiveView has drawn this line since #69; this
+    /// shared label (sidebar + Settings) had not, so the two screens disagreed about the same link.
     public var connectionStatusLabel: String {
-        if connected && bonded { return "Bonded · streaming" }
+        if connected && encryptedBond { return "Bonded · streaming" }
+        if connected && bonded { return "Live HR (not fully paired)" }
         if connected { return "Connected" }
-        if bonded { return "Bonded · idle" }
+        if encryptedBond { return "Bonded · idle" }
+        // No `bonded`-only idle arm: without an encrypted bond there was never a pairing to be idle from.
         return "Disconnected"
     }
-    /// True when the link is up (HR flowing) → status reads green. Drives the sidebar + Settings tone.
-    public var connectionStatusIsActive: Bool { connected }
-    /// True when previously paired but not currently connected → amber.
-    public var connectionStatusIsIdle: Bool { !connected && bonded }
+    /// True when the link is up with a REAL encrypted bond → status reads green. A live-HR-only link is
+    /// amber via [connectionStatusIsIdle]: it works, but every pairing-gated feature is unavailable.
+    public var connectionStatusIsActive: Bool { connected && encryptedBond }
+    /// True when previously paired but not currently connected, OR connected with live HR but no
+    /// encrypted bond → amber either way.
+    public var connectionStatusIsIdle: Bool { (!connected && bonded) || (connected && !encryptedBond) }
 
     /// Fired (live only) when the strap reports a DOUBLE_TAP gesture. Wired by AppModel to the
     /// user's chosen action. Debounced in AppModel.
@@ -400,6 +446,13 @@ public final class LiveState: ObservableObject {
     /// True while a historical offload session is running, so screens can say "Syncing strap
     /// history…" instead of presenting half-loaded data as final (#77).
     @Published public var backfilling = false
+    /// #1164 — true when the strap reports banked records newer than our local HR frontier (the strap has
+    /// data we haven't ingested yet), even when no offload is actively running. Set by BLEManager from the
+    /// GET_DATA_RANGE newest vs. the collector's latest HR sample, with the same 5-min `behindGapSeconds`
+    /// the auto-continue predicate uses. Cleared on disconnect so a stale "pending" can't outlive the link.
+    /// Drives the Today Rest "Pending sync" state so a provisional score isn't shown as final before the
+    /// full night is offloaded. Twin of the Android LiveState.historyPendingSync.
+    @Published public var historyPendingSync = false
     /// Chunks acked during the current offload session — an honest progress signal (total pending is
     /// unknowable from the protocol, so a count, never a percent).
     @Published public var syncChunksThisSession: Int = 0
@@ -732,7 +785,12 @@ public final class LiveState: ObservableObject {
         #endif
         var header = "NOOP strap log (scheduled export) — \(osName)\nApp: \(v)\n\(osName): "
             + ProcessInfo.processInfo.operatingSystemVersionString + "\n"
-        if !extraHeaderLines.isEmpty { header += extraHeaderLines.joined(separator: "\n") + "\n" }
+        // #453: the BODY is scrubbed as it is appended, but these header lines come from the diagnostics
+        // block and never pass through that path - and they carry device ids, which embed a BLE address
+        // for a re-added or second strap. Same redactor, so one export cannot be safe while the other leaks.
+        if !extraHeaderLines.isEmpty {
+            header += extraHeaderLines.map { Self.redactPii($0) }.joined(separator: "\n") + "\n"
+        }
         header += String(repeating: "-", count: 40) + "\n"
         // Same generations-then-current shape as `exportableLogText()`: a scheduled drop that fires after a
         // restart must not report only the (possibly empty) current tail.
@@ -750,17 +808,176 @@ public final class LiveState: ObservableObject {
     /// service base (…-8d6d-82b8-614a-1c8cb0f8dcc6) — those are public, identical on every strap, and
     /// are exactly the GATT diagnostics a shared log needs to be useful (#421). Thanks @ujix (#447) for
     /// catching the peripheral-UUID leak; this is a targeted form so we don't redact the service UUIDs.
+    /// #1833: mask a WHOOP serial that arrives as HEX rather than as text.
+    ///
+    /// Every rule in `redactPii` matches an identifier written as characters. None can see one encoded
+    /// as hex, because they are reading hex digits and not the ASCII those bytes decode to. On a 5/MG,
+    /// event 109 carries the strap serial as plain ASCII inside its payload, so any diagnostic that dumps
+    /// a frame or payload puts the serial into the log we ask people to attach to public issues — while
+    /// the MAC rule keeps firing, so the line still LOOKS redacted.
+    ///
+    /// Deliberately NOT keyed on a label. This side writes hex as `frame=…` (the clock diagnostic),
+    /// `[raw …]` and `(raw …)` (the alarm readback), and the #900 whole-frame dump carries none. A rule
+    /// enumerating today's phrasings is one the next diagnostic slips past. Matching the hex itself needs
+    /// no maintenance and covers dumps not yet written.
+    ///
+    /// Only bytes inside a serial-shaped ASCII run are masked; the rest of the dump survives, because the
+    /// payload is exactly where an undocumented field would be found. Twin of `redactHexDumpPii`.
+    nonisolated static func redactHexDump(_ hex: String) -> String {
+        let chars = Array(hex)
+        // NO even-length requirement, deliberately. The run regex matches consecutive hex characters, so
+        // a dump abutting other hex-valid text yields an ODD-length match — and bailing on that returned
+        // the serial UNREDACTED, while the Kotlin twin processed the even prefix and masked it. Swift was
+        // the weaker half of a pair that has to behave identically. Process what pairs up, ignore a
+        // trailing half-byte.
+        guard chars.count >= 16 else { return hex }
+        var bytes = [UInt8](); bytes.reserveCapacity(chars.count / 2)
+        var i = 0
+        while i + 1 < chars.count {
+            guard let b = UInt8(String(chars[i...(i + 1)]), radix: 16) else { return hex }
+            bytes.append(b); i += 2
+        }
+        var out = chars
+        var runStart = -1
+        func closeRun(_ end: Int) {
+            defer { runStart = -1 }
+            guard runStart >= 0 else { return }
+            // Anchor on the first LETTER with enough run left after it, mirroring the Kotlin regex
+            // `[A-Za-z][0-9A-Za-z]{8,}` — which finds a serial ANYWHERE inside an alphanumeric run, not
+            // only at its start. Testing just the run's first byte left the serial exposed whenever a
+            // digit happened to precede it with no separator, and Kotlin masked the same bytes. Two
+            // halves of one rule disagreeing about which payloads are safe is the failure to avoid.
+            var i = runStart
+            while i < end {
+                let b = bytes[i]
+                let isLetter = (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+                if isLetter, end - i >= 9 {
+                    for k in i..<end { out[k * 2] = "•"; out[k * 2 + 1] = "•" }
+                    return
+                }
+                i += 1
+            }
+        }
+        for (idx, b) in bytes.enumerated() {
+            let alnum = (b >= 48 && b <= 57) || (b >= 65 && b <= 90) || (b >= 97 && b <= 122)
+            if alnum { if runStart < 0 { runStart = idx } } else { closeRun(idx) }
+        }
+        closeRun(bytes.count)
+        return String(out)
+    }
+
+    /// Tokens that identify a MODEL rather than a person, for `logSafeDeviceName`.
+    ///
+    /// Two shapes only, both EXACT: a known vendor, product or model word, and a version number ("4.0").
+    ///
+    /// There is deliberately no letters-plus-digits pattern for model codes. One was tried and it
+    /// defeated the whole design: "[a-z]{1,4}\\d{1,3}" matches "Ryan1" and "Sam99" as readily as "H10",
+    /// so a first name with a digit passed through untouched. A pattern cannot be an allowlist - the
+    /// moment a rule describes a SHAPE rather than a known value it admits everything else of that
+    /// shape. Model codes are therefore listed one by one.
+    ///
+    /// The cost is that an unlisted device logs as "<name>" until its code is added, which is the right
+    /// direction to fail: a missing model is an inconvenience, a leaked name is not.
+    ///
+    /// Anything not on this list is DROPPED, which is the point: a naming shape nobody anticipated loses
+    /// by default. Kotlin twin: `SAFE_DEVICE_NAME_TOKEN_RE`.
+    private static let safeDeviceNameToken = try? NSRegularExpression(
+        pattern: "^(whoop|mg|polar|verity|sense|wahoo|tickr|garmin|hrm|forerunner|fenix|vantage|ignite|amazfit|huami|zepp|xiaomi|mi|band|coospo|magene|suunto|scosche|rhythm|kickr|tacx|elite|cateye|decathlon|kalenji|geonaute|h6|h7|h9|h10|h64|h808s|oh1|dual|\\d+(\\.\\d+)?)$", options: [.caseInsensitive])
+
+    /// A device name reduced to what is safe to put in a shared log: the MODEL, never the person.
+    ///
+    /// WHOOP seeds a strap's name from the account holder ("<FirstName>'s Whoop") and people rename
+    /// straps to anything at all. `redactPii` can only GUESS which words in a line are a name; here the
+    /// whole string IS the advertised name, so the safe move is an ALLOWLIST - keep the tokens known to
+    /// name a model and drop everything else. A naming shape nobody anticipated is then dropped by
+    /// default rather than needing a rule to catch it: "Ryan B's WHOOP 4.0" keeps only "WHOOP 4.0", and
+    /// "Dad's spare" keeps nothing.
+    ///
+    /// The "no name advertised" sentinel survives, because "we saw no name" and "we removed a name" are
+    /// different facts to whoever reads the log. Kotlin twin: `logSafeDeviceName`.
+    nonisolated static func logSafeDeviceName(_ name: String?) -> String {
+        let n = (name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        if n.isEmpty || n == "unknown" { return "unknown" }
+        let tokens = n.split(whereSeparator: { $0.isWhitespace })
+        let safe = tokens.filter { tok in
+            guard let re = Self.safeDeviceNameToken else { return false }
+            let t = String(tok)
+            return re.firstMatch(in: t, range: NSRange(location: 0, length: (t as NSString).length)) != nil
+        }
+        // Say "<name>" only when something was actually removed. An unrenamed "WHOOP 4.0" or "Polar H10"
+        // carries nothing personal, and prefixing it would claim a redaction that never happened.
+        if safe.count == tokens.count { return n }
+        return safe.isEmpty ? "<name>" : "<name> " + safe.joined(separator: " ")
+    }
+
+    private static let hexRunRegex = try? NSRegularExpression(pattern: "[0-9a-fA-F]{16,}")
+
     nonisolated static func redactPii(_ s: String) -> String {
         var out = s
+        // Hex first: the text rules below must not see (or mangle) a run we are about to mask.
+        if let re = Self.hexRunRegex {
+            let ns = out as NSString
+            let matches = re.matches(in: out, range: NSRange(location: 0, length: ns.length))
+            if !matches.isEmpty {
+                var rebuilt = ""
+                var last = 0
+                for m in matches {
+                    rebuilt += ns.substring(with: NSRange(location: last, length: m.range.location - last))
+                    rebuilt += Self.redactHexDump(ns.substring(with: m.range))
+                    last = m.range.location + m.range.length
+                }
+                rebuilt += ns.substring(from: last)
+                out = rebuilt
+            }
+        }
         out = out.replacingOccurrences(
             of: "([0-9A-Fa-f]{2}):[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:([0-9A-Fa-f]{2})",
             with: "$1:••:••:••:••:$2", options: .regularExpression)
+        // #1193 field capture: the old rule required a DIGIT straight after "WHOOP ", but real serials
+        // start with letters as often as digits - "WHOOP MGB0779473" sat unredacted in a log attached to
+        // an issue while "WHOOP 4C1594026" beside it was masked. The rule now accepts any alnum run of 6+
+        // that CONTAINS a digit.
+        //
+        // The digit requirement is not decoration, it is what keeps this from eating words: "WHOOP PUFFIN
+        // service 1150" is a real diagnostic line, and PUFFIN is six alnum characters. A serial always
+        // carries a digit; a word does not. "WHOOP 4.0" stays untouched for a different reason - the dot
+        // stops the run at one character, short of the six the lookahead demands.
         out = out.replacingOccurrences(
-            of: "WHOOP (\\d[0-9A-Za-z]{5,})", with: "WHOOP <serial>", options: .regularExpression)
+            of: "WHOOP (?=[0-9A-Za-z]{6,})[0-9A-Za-z]*[0-9][0-9A-Za-z]*", with: "WHOOP <serial>", options: .regularExpression)
         // Mask a CoreBluetooth peripheral UUID, but NOT a standard-BLE / WHOOP-vendor service UUID.
         out = out.replacingOccurrences(
             of: "(?![0-9A-Fa-f]{8}-(?:0000-1000-8000-00805f9b34fb|8d6d-82b8-614a-1c8cb0f8dcc6))[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
             with: "<device>", options: [.regularExpression, .caseInsensitive])
+        // #1303: an ADOPTED device id (`whoop-<SERIAL>`) is a device identifier in every line that prints
+        // an id. Neither rule above catches it — the MAC rule wants MAC shape and the serial rule wants the
+        // literal "WHOOP " then a DIGIT, while an adopted id is `whoop-` + a serial commonly starting with
+        // a letter. Keeps three characters, matching `WhoopSerialIdentity.logSafe`, so two straps stay
+        // distinguishable; PRESERVES the `-noop` computed-sibling suffix, which is not identifying and is
+        // what lets a reader tell derived rows from measured ones. Six-character minimum matches
+        // `minSerialLength`, so `my-whoop` and `my-whoop-noop` are untouched. Kotlin twin in
+        // `redactStrapLogPii`.
+        out = out.replacingOccurrences(
+            of: "whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}(-noop)",
+            with: "whoop-$1…$2", options: .regularExpression)
+        out = out.replacingOccurrences(
+            of: "whoop-([A-Za-z0-9]{3})[A-Za-z0-9-]{3,}",
+            with: "whoop-$1…", options: .regularExpression)
+        // The account holder's NAME, as WHOOP writes it into the advertised local name. WHOOP names a
+        // strap "<FirstName>'s Whoop" by default and the scan path logs that name on every discovery, so
+        // the shareable log (#445) we ask people to attach to public issues carried a real person's name.
+        // No rule above could see it: they key on MAC shape, "WHOOP " + digit, or a "whoop-" id.
+        //
+        // Keeps the possessive and whatever follows, so "Ryan's WHOOP 4.0" keeps the MODEL, which is
+        // diagnostic and identifies nobody. Matches the curly apostrophe because Apple platforms write
+        // U+2019 into default device names — a straight-quote-only rule would miss this platform's logs.
+        //
+        // LIMITATION, deliberate: exactly ONE token before the possessive, so "Ryan B's Whoop" keeps
+        // "Ryan". A multi-token rule cannot tell a name from the surrounding log text and would swallow
+        // "Discovered" with it. A fully custom name with no possessive stays a known gap. Kotlin twin in
+        // `redactStrapLogPii` as `PII_DEVICE_NAME_RE`.
+        out = out.replacingOccurrences(
+            of: "[\\p{L}\\p{N}_.\\-]+(['\u{2019}]s\\s+(?i:whoop))",
+            with: "<name>$1", options: .regularExpression)
         return out
     }
 
@@ -791,7 +1008,12 @@ public final class LiveState: ObservableObject {
         let healthLines = HealthSyncStats.summaryLines()
         if !healthLines.isEmpty { header += healthLines.joined(separator: "\n") + "\n" }
         #endif
-        if !extraHeaderLines.isEmpty { header += extraHeaderLines.joined(separator: "\n") + "\n" }
+        // #453: the BODY is scrubbed as it is appended, but these header lines come from the diagnostics
+        // block and never pass through that path - and they carry device ids, which embed a BLE address
+        // for a re-added or second strap. Same redactor, so one export cannot be safe while the other leaks.
+        if !extraHeaderLines.isEmpty {
+            header += extraHeaderLines.map { Self.redactPii($0) }.joined(separator: "\n") + "\n"
+        }
         header += String(repeating: "-", count: 40) + "\n"
         // Previous processes first, so the body stays in chronological order and the log-parsing tools read
         // it unchanged — they just get the night that a wake-time restart used to erase.

@@ -118,6 +118,9 @@ fun DataSourcesScreen(vm: AppViewModel) {
     val hcLastSync by vm.hcLastSync.collectAsStateWithLifecycle()
     val hcWriteback by vm.hcWriteback.collectAsStateWithLifecycle()
     val hcWbStatus by vm.hcWritebackStatus.collectAsStateWithLifecycle()
+    var hcReadCategories by remember {
+        mutableStateOf(HealthConnectImporter.selectedCategories(context))
+    }
     // A background (BLE-path) writeback updates prefs, not the VM's flow — re-read on entry so the
     // status line reflects the latest attempt whenever this screen is opened (#660).
     LaunchedEffect(Unit) { vm.refreshHcWritebackStatus() }
@@ -285,7 +288,8 @@ fun DataSourcesScreen(vm: AppViewModel) {
     val hcPermissionLauncher = rememberLauncherForActivityResult(
         PermissionController.createRequestPermissionResultContract(),
     ) { granted ->
-        if (granted.any { it in HealthConnectImporter.PERMISSIONS }) {
+        val selectedPermissions = HealthConnectImporter.permissionsFor(hcReadCategories)
+        if (granted.any { it in selectedPermissions }) {
             runImport { HealthConnectImporter.import(context, vm.repo, ProfileStore.from(context).heightCm) }
         } else {
             Toast.makeText(context, "Health Connect access not granted.", Toast.LENGTH_LONG).show()
@@ -307,16 +311,22 @@ fun DataSourcesScreen(vm: AppViewModel) {
             val granted = runCatching {
                 HealthConnectImporter.client(context).permissionController.getGrantedPermissions()
             }.getOrDefault(emptySet())
+            // #645: a user who predates the selector has nothing stored. Recover their real scope from
+            // what Android already grants BEFORE the checkboxes are read back, or a first visit would
+            // show Recovery-only and saving it would lock in the narrowing.
+            HealthConnectImporter.migrateSelectionFromGrants(context, granted)
+            hcReadCategories = HealthConnectImporter.selectedCategories(context)
+            val selectedPermissions = HealthConnectImporter.permissionsFor(hcReadCategories)
             // `any` (not `all`) is deliberate — partial grants are supported (#150). But that alone
             // would never ASK about a permission added in an update, so a newly-read type would come
             // back empty forever (#949). Route through the request once when the set has grown.
-            if (granted.any { it in HealthConnectImporter.PERMISSIONS } &&
-                !HealthConnectImporter.hasUnaskedPermissions(context)
+            if (granted.any { it in selectedPermissions } &&
+                !HealthConnectImporter.hasUnaskedPermissions(context, hcReadCategories)
             ) {
                 runImport { HealthConnectImporter.import(context, vm.repo, ProfileStore.from(context).heightCm) }
             } else {
-                HealthConnectImporter.markPermissionsAsked(context)
-                hcPermissionLauncher.launch(HealthConnectImporter.PERMISSIONS)
+                HealthConnectImporter.markPermissionsAsked(context, hcReadCategories)
+                hcPermissionLauncher.launch(selectedPermissions)
             }
         }
     }
@@ -483,6 +493,13 @@ fun DataSourcesScreen(vm: AppViewModel) {
                 )
             }
             if (healthConnectAvailable) {
+                HealthConnectCategorySelector(
+                    selected = hcReadCategories,
+                    onSelectionChange = { categories ->
+                        hcReadCategories = categories
+                        HealthConnectImporter.setSelectedCategories(context, categories)
+                    },
+                )
                 BackupButton(
                     label = uiString(R.string.l10n_data_sources_screen_import_from_health_connect_35d55e21),
                     icon = Icons.Filled.FileUpload,
@@ -867,7 +884,17 @@ fun DataSourcesScreen(vm: AppViewModel) {
             subtitle = "Pairs directly with your strap over Bluetooth: no WHOOP app, no cloud.",
         ) {
             val (label, tone) = when {
-                live.bonded -> "Bonded, streaming." to StrandTone.Positive
+                // encryptedBond, not bonded — see strapStatusTitle. A 5/MG streaming over the open
+                // profile has bonded == true with no pairing at all, and after #1635 hello suppression it
+                // stays there for good rather than passing through.
+                //
+                // "Live HR" reads a little wide here: bonded means REACHABLE, not currently streaming. It
+                // survives the stream stopping (take the strap off mid-link and it stays true), and the
+                // unbonded offload probe is a second way in — it sets bonded on a strap that answered a
+                // command without ever having sent an HR reading. Both are the same state: reachable over
+                // the open profile, never encrypted.
+                live.encryptedBond -> "Bonded, streaming." to StrandTone.Positive
+                live.bonded -> "Live HR (not fully paired)" to StrandTone.Warning
                 live.connected -> "Connected, pairing…" to StrandTone.Warning
                 else -> "Not connected. Open Live to pair." to StrandTone.Critical
             }
@@ -1043,6 +1070,27 @@ internal fun emitImportTrace(
         // rowsOut is UNVERIFIED on Android (Room reports no store-write count); never claim "(all written)".
         vm.ble.externalLog(
             com.noop.analytics.ImportTrace.stageLineUnverified(category, rowsIn = count),
+            com.noop.testcentre.TestDomain.IMPORT,
+        )
+    }
+    // #1617: which metric COLUMNS the file actually carried. rowsOut stays unverified here because Room
+    // reports no write count, but this is known at PARSE time and so is exact on both platforms — and it
+    // separates "the store never got it" from "the export never had it", which the stage lines alone
+    // cannot. Emitted only when the importer produced daily rows.
+    // Emitted generically here for any summary carrying coverage, while the Swift twin emits it inside
+    // WhoopImporter — so a NEW importer that starts filling columnCoverage would produce this line on
+    // Android and silently not on Swift. Give it the Swift twin at the same time.
+    if (summary.columnCoverage.isNotEmpty()) {
+        vm.ble.externalLog(
+            com.noop.analytics.ImportTrace.columnCoverageLine(
+                // The literal, not categoryWire: that function maps RAW TABLE KEYS to wire categories
+                // ("dailyMetric" -> "cycles"), so handing it a category already in wire form only works
+                // through its `else -> rawKey` fallthrough, and would break the day anyone adds a
+                // "cycles" branch. The Swift twin passes the same literal.
+                stage = "cycles",
+                rows = summary.columnCoverageRows,
+                counts = summary.columnCoverage,
+            ),
             com.noop.testcentre.TestDomain.IMPORT,
         )
     }

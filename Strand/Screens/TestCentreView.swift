@@ -4,6 +4,7 @@ import StrandAnalytics
 import StrandImport
 import PolarProtocol
 import WhoopStore
+import WhoopProtocol
 
 /// Settings -> Test Centre. The single home for every diagnostic, log and test control (spec section 7).
 ///
@@ -29,12 +30,25 @@ struct TestCentreView: View {
     @State private var infoMessage = ""
     @State private var showInfo = false
 
+    // #1853: skin-temp absolute backfill (on-demand, diagnostic-first). Runs the walker that fills
+    // `skinTempC` for nights outside the 21-night rescore window. In-progress flag + last result line.
+    @State private var skinTempBackfillRunning = false
+    @State private var skinTempBackfillStatus: String?
+
     // Section 3: scheduled daily auto-export, the same ScheduledDebugExport store the Settings card uses.
     @State private var debugExportOn = ScheduledDebugExport.isEnabled
     @State private var debugExportMinutes = ScheduledDebugExport.timeMinutes
     // Retention (#650): how many scheduled-export generations to keep, and the manual clear confirm.
     @State private var debugExportKeep = ScheduledDebugExport.keepCount
     @State private var showClearExportsConfirm = false
+
+    // WHOOP 5/MG developer controls. These use the same persisted keys as the former Settings card;
+    // moving the UI does not reset an opt-in or lose the ability to undo a persistent strap write.
+    @AppStorage(PuffinExperiment.defaultsKey) private var puffinExperiments = false
+    @AppStorage(PuffinFrameRecorder.enabledKey) private var puffinCapture = false
+    @AppStorage(PuffinExperiment.deepDataKey) private var deepDataEnabled = false
+    @AppStorage(PuffinExperiment.broadcastHrKey) private var broadcastHrEnabled = false
+    @AppStorage(PuffinExperiment.ecgRawDataKey) private var ecgRawDataEnabled = false
 
     /// The strap model the user last picked, the same key SettingsView's showFiveMGControls gate reads.
     @AppStorage("selectedWhoopModel") private var selectedWhoopModelRaw = WhoopModel.whoop4.rawValue
@@ -77,6 +91,8 @@ struct TestCentreView: View {
             VStack(alignment: .leading, spacing: NoopMetrics.sectionSpacing) {
                 domainModesCard.staggeredAppear(index: 0)
                 diagnosticToolsCard.staggeredAppear(index: 1)
+                if is5MG { rawDataCollectorCard.staggeredAppear(index: 2) }
+                if is5MG { fiveMGProtocolDiagnosticsCard.staggeredAppear(index: 3) }
                 exportCard.staggeredAppear(index: 2)
                 experimentalAlgorithmsCard.staggeredAppear(index: 3)
             }
@@ -132,6 +148,100 @@ struct TestCentreView: View {
 
     // MARK: - Section 2: Diagnostic tools (strap log + recalibrate + env dump)
 
+    @ViewBuilder private var rawDataCollectorCard: some View {
+        NoopCard {
+            VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+                Text("5/MG RAW DATA COLLECTOR")
+                    .font(StrandFont.overline).tracking(StrandFont.overlineTracking)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                Text("Record, review, export, and delete bounded 100 Hz motion sessions. Normal sync is unchanged.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                NavigationLink {
+                    RawDataCollectorView()
+                } label: {
+                    Label("Open raw-data collector", systemImage: "waveform.path.ecg")
+                }
+                .buttonStyle(NoopButtonStyle(.primary, fullWidth: true))
+                Text(live.connected ? "WHOOP 5/MG connected." : "Connect your WHOOP 5/MG to start a raw-data session.")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(live.connected ? StrandPalette.textSecondary : StrandPalette.statusWarning)
+            }
+        }
+    }
+
+    @ViewBuilder private var fiveMGProtocolDiagnosticsCard: some View {
+        NoopCard {
+            VStack(alignment: .leading, spacing: NoopMetrics.space3) {
+                Text("5/MG PROTOCOL DIAGNOSTICS")
+                    .font(StrandFont.overline).tracking(StrandFont.overlineTracking)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                Text("Developer tools for unmapped protocol features. None of these are required for normal WHOOP 5/MG recording, history sync, or the bounded Raw Data Collector.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Toggle("Protocol probes", isOn: $puffinExperiments)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+                Text("Sends experimental protocol queries and records the replies in the strap log.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+
+                Divider().overlay(StrandPalette.hairline)
+                Toggle("Broadcast heart rate from the strap", isOn: $broadcastHrEnabled)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+                    .onChangeCompat(of: broadcastHrEnabled) { model.ble.setBroadcastHr($0) }
+                Text("Writes the reversible 5/MG advertising flag for Garmin, Zwift, and compatible gym equipment.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+
+                Divider().overlay(StrandPalette.hairline)
+                Toggle("Legacy R22 feature-flag experiment", isOn: $deepDataEnabled)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+                Text("The strap accepts these writes, but NOOP has not observed them enabling a separate live stream. This is not the Raw Data Collector.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                if deepDataEnabled {
+                    NoopButton("Send legacy R22 enable sequence", systemImage: "bolt.badge.automatic", kind: .secondary) {
+                        model.ble.enableWhoop5DeepData()
+                    }
+                    .disabled(!live.encryptedBond || !live.worn)
+                }
+                NoopButton("Clear legacy R22 flags on strap", systemImage: "bolt.slash", kind: .secondary) {
+                    model.ble.disableWhoop5DeepData()
+                }
+                .disabled(!live.encryptedBond || live.r22DisableReport == BLEManager.deviceConfigProbeWaiting)
+                if let result = live.r22DisableReport {
+                    Text(result).font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Divider().overlay(StrandPalette.hairline)
+                Toggle("WHOOP MG ECG raw-data gate", isOn: $ecgRawDataEnabled)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+                Text("MG-only protocol instrumentation, not a medical ECG feature.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                if ecgRawDataEnabled {
+                    HStack(spacing: NoopMetrics.space3) {
+                        NoopButton("Gate on", systemImage: "waveform.path.ecg", kind: .secondary) {
+                            model.ble.setEcgRawDataGate(true)
+                        }
+                        NoopButton("Gate off", systemImage: "arrow.uturn.backward", kind: .secondary) {
+                            model.ble.setEcgRawDataGate(false)
+                        }
+                    }
+                    .disabled(!live.encryptedBond || live.whoop5Variant != Whoop5Variant.mg.label)
+                    if let result = live.ecgRawDataGate {
+                        Text(result.summary).font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                    }
+                }
+
+                Divider().overlay(StrandPalette.hairline)
+                Toggle("Passive history/protocol trace", isOn: $puffinCapture)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+                Text("Records frames that already arrive. It does not start sensors and can create large files. Use the export section below to save the trace with its strap log.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
     @ViewBuilder private var diagnosticToolsCard: some View {
         NoopCard {
             VStack(alignment: .leading, spacing: NoopMetrics.space3) {
@@ -169,6 +279,25 @@ struct TestCentreView: View {
                 Text("Re-anchors every baseline that feeds Charge to your recent nights. No stored day is deleted.")
                     .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
                     .fixedSize(horizontal: false, vertical: true)
+
+                Divider().overlay(StrandPalette.hairline)
+
+                // #1853: skin-temp absolute backfill (on-demand, diagnostic-first). Fills `skinTempC`
+                // for nights outside the 21-night rescore window that never got an absolute. Fill-only:
+                // it can only fill a NULL, never overwrite a measured value or touch the deviation.
+                NoopButton("Backfill skin-temp absolutes", systemImage: "thermometer.medium",
+                           kind: .secondary) {
+                    runSkinTempBackfill()
+                }
+                .disabled(skinTempBackfillRunning)
+                Text("Re-derives the absolute °C for nights the 21-night rescore window never reaches, using the same funnel as the scoring pass. Fill-only: it never overwrites a measured value. Watch the strap log for the result.")
+                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let status = skinTempBackfillStatus {
+                    Text(status)
+                        .font(StrandFont.caption).foregroundStyle(StrandPalette.textSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
 
                 Divider().overlay(StrandPalette.hairline)
 
@@ -417,6 +546,37 @@ struct TestCentreView: View {
         showInfo = true
     }
 
+    /// #1853: run the skin-temp absolute backfill on demand (diagnostic-first trigger). The walker
+    /// resolves the WHOOP 4.0 window anchor from the current scoring window, pages through the
+    /// candidate nights, and fills each NULL `skinTempC`. The result is logged to the strap log and
+    /// shown under the button so the user sees exactly what filled, declined, and had no raw data.
+    private func runSkinTempBackfill() {
+        guard !skinTempBackfillRunning else { return }
+        skinTempBackfillRunning = true
+        skinTempBackfillStatus = String(localized: "Backfilling…")
+        Task { @MainActor in
+            guard let store = await model.repo.storeHandle() else {
+                skinTempBackfillStatus = String(localized: "No on-device store yet.")
+                skinTempBackfillRunning = false
+                return
+            }
+            let walker = SkinTempBackfillWalker(store: store)
+            let result = await walker.runBackfill()
+            let anchorNote = result.windowAnchorRaw != nil
+                ? "anchor from current window"
+                : "no 4.0 anchor (5/MG or too few worn samples)"
+            let endNote = result.reachedEnd ? "reached end" : "hit page budget"
+            let line = "skin-temp backfill (#1853): filled \(result.filledCount), " +
+                       "declined \(result.declinedCount), no raw data \(result.noRawDataCount) " +
+                       "(\(anchorNote), \(endNote))"
+            live.append(log: line)
+            skinTempBackfillStatus = line
+            skinTempBackfillRunning = false
+            // Refresh so the newly-filled absolutes show in the charts/explorer.
+            await model.repo.refresh()
+        }
+    }
+
     private var debugExportTimeBinding: Binding<Date> {
         Binding(
             get: {
@@ -643,7 +803,8 @@ private struct ConnectionReadoutPanel: View {
         // LiveState field FrameRouter writes.
         let deviceClock = ConnectionReadout.clockCorrelatedDevice(logLines: live.log)
         let rtcWarning = ConnectionReadout.rtcWarning(deviceClockUnix: deviceClock,
-                                                      strapNewestUnix: live.strapRange?.newestUnix)
+                                                      strapNewestUnix: live.strapRange?.newestUnix,
+                                                      batteryPct: live.batterySamples.last?.soc)
         VStack(alignment: .leading, spacing: 4) {
             ReadoutRow(label: String(localized: "Connection uptime"), value: uptime)
             ReadoutRow(label: String(localized: "Reconnects this run"), value: String(reconnects))

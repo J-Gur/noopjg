@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
@@ -105,10 +106,9 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
     val activeWorkout by viewModel.activeWorkout.collectAsStateWithLifecycle()
     val lastWorkout by viewModel.lastWorkout.collectAsStateWithLifecycle()
 
-    // Imperial/Metric display preference (D#103). Live distance/pace are computed from metres + sec/km
-    // and re-labelled here. Display-only.
+    // Exercise-distance preference (#1913). Stored workout data remains SI.
     val context = LocalContext.current
-    val unitSystem = UnitPrefs.system(context)
+    val unitSystem = UnitPrefs.distanceSystem(context)
     // Effort display scale (#268) — routes the live + saved workout Effort read-outs. Display-only.
     val effortScale = UnitPrefs.effortScale(context)
     // Same day-cycle gate as the liquid Today (LiquidScreenSky.kt): the time-of-day sky settles behind the
@@ -370,11 +370,20 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
             LaunchedEffect(w.startMs) {
                 while (true) { nowMs = System.currentTimeMillis(); delay(1000) }
             }
-            val elapsedS = ((nowMs - w.startMs) / 1000).coerceAtLeast(0)
+            val elapsedS = ActiveWorkoutClock.activeElapsedSeconds(
+                startMs = w.startMs, pausedAtMs = w.pausedAtMs,
+                pausedDurationMs = w.pausedDurationMs, nowMs = nowMs,
+            )
             NoopCard(tint = Palette.effortColor) {
                 Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                         Text(uiString(R.string.l10n_live_screen_w_sport_name_uppercase_e59bc678, w.sport.name.uppercase()), style = NoopType.overline, color = Palette.statusCritical)
+                        // A frozen clock alone is ambiguous with a STALLED one, so say which it is. Reuses
+                        // the string #1533 already localized rather than minting new copy for a tag.
+                        if (w.pausedAtMs != null) {
+                            Spacer(Modifier.width(Metrics.space8))
+                            Text(uiString(R.string.workout_action_paused), style = NoopType.overline, color = Palette.textSecondary)
+                        }
                         Spacer(Modifier.weight(1f))
                         Text(
                             // Shared clock: M:SS up to an hour, H:MM:SS past it (so a long session reads
@@ -397,14 +406,30 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
                             StatTile(modifier = Modifier.weight(1f), label = uiString(R.string.l10n_live_screen_pace_7a9a6226), value = w.paceSecPerKm?.let { livePace(it, unitSystem) } ?: "—")
                         }
                     }
-                    Button(
-                        onClick = { confirmingEnd = true },
-                        modifier = Modifier.fillMaxWidth(),
-                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
-                        ),
-                    ) { Text(uiString(R.string.l10n_live_screen_end_workout_3e8d6238), style = NoopType.captionNumber) }
+                    // The card used to offer End and nothing else, so the only IRREVERSIBLE control was the
+                    // one reachable without opening the live overlay, while Pause — the reversible one —
+                    // was not. One toggle: a paused session has exactly one sensible next action.
+                    Row(horizontalArrangement = Arrangement.spacedBy(Metrics.gap), modifier = Modifier.fillMaxWidth()) {
+                        Button(
+                            onClick = { viewModel.toggleWorkoutPause() },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                        ) {
+                            Text(
+                                if (w.pausedAtMs != null) uiString(R.string.workout_action_resume)
+                                else uiString(R.string.workout_action_pause),
+                                style = NoopType.captionNumber,
+                            )
+                        }
+                        Button(
+                            onClick = { confirmingEnd = true },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 8.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = Palette.statusCritical, contentColor = Palette.surfaceBase,
+                            ),
+                        ) { Text(uiString(R.string.l10n_live_screen_end_workout_3e8d6238), style = NoopType.captionNumber) }
+                    }
                 }
             }
             if (confirmingEnd) {
@@ -614,12 +639,17 @@ fun LiveScreen(viewModel: AppViewModel, onManageDevices: () -> Unit = {}) {
         }
 
         // Manual "Sync now" — kick a historical offload on demand instead of waiting for the 15-min
-        // periodic timer (#93). Only meaningful once bonded (the offload needs the command channel), and
-        // disabled mid-session so a double-tap can't fight the in-flight offload — viewModel.syncNow()
-        // also no-ops in that case, this is just the matching UI state. While syncing, the button shows
+        // periodic timer (#93). Needs a strap that can actually hand over history, and disabled
+        // mid-session so a double-tap can't fight the in-flight offload — viewModel.syncNow() also
+        // no-ops in that case, this is just the matching UI state.
+        //
+        // `bonded` alone was NOT that condition and this comment used to say it was: the live-HR path
+        // sets it for a 5/MG that has never completed a handshake, so the button appeared, was pressed,
+        // and beginBackfill declined it in silence. historyReady is the client's own precondition, so
+        // the button can only vanish where the offload would have been refused anyway. While syncing, the button shows
         // an INDETERMINATE spinner (NEVER a percent — total pending records are unknowable from the
         // protocol); the "Syncing your strap history… N chunks pulled" line above carries the live count.
-        if (live.bonded) {
+        if (live.bonded && live.historyReady) {
             item {
             OutlinedButton(
                 onClick = { viewModel.syncNow() },

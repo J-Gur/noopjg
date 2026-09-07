@@ -132,11 +132,12 @@ fun StepsCalibrationScreen(
         )
         val rows = ArrayList<StepsComparisonRow>()
         val motions = ArrayList<Double>()
+        val activeStrapId = vm.activeStrapId
         for ((day, phone) in phoneDays.take(10)) {           // scan extra to fill 7 after motion gaps
             val mid = runCatching {
                 LocalDate.parse(day).atStartOfDay(ZoneId.systemDefault()).toEpochSecond()
             }.getOrNull() ?: continue
-            val grav = vm.repo.gravitySamples("my-whoop", mid, mid + 86_400 - 1)
+            val grav = vm.repo.gravitySamplesUnion(activeStrapId, mid, mid + 86_400 - 1)
             val motion = StepsEstimateEngine.dayMotionIntensity(grav)
             val est = StepsEstimateEngine.estimate(motion, cal) ?: continue
             motions.add(motion)
@@ -156,7 +157,12 @@ fun StepsCalibrationScreen(
                     .weight(1f)
                     .fillMaxWidth()
                     .verticalScroll(scroll)
-                    .padding(20.dp),
+                    // #1836: this is a NavHost destination that scrolls WITHOUT ScreenScaffold, so it does
+                    // not inherit the scaffold's bar clearance. In the overlay layout the screen reaches the
+                    // bottom edge, so without this the last rows sit behind the bar. Zero when the overlay
+                    // is off. Any future destination that scrolls outside ScreenScaffold needs the same.
+                    .padding(20.dp)
+                    .padding(bottom = BottomBarStyleStore.barHeightForContent()),
                 verticalArrangement = Arrangement.spacedBy(Metrics.sectionGap),
             ) {
                 ExplainerCard()

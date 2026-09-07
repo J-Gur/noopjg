@@ -3,6 +3,7 @@ package com.noop.data
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
+import androidx.room.PrimaryKey
 
 /*
  * Room entities mirroring the verified GRDB schema in
@@ -321,6 +322,22 @@ data class DailyMetric(
     // Five-minute SDNN index (ms), separate from avgHrv (RMSSD). Strap rows compute it from in-bed R-R;
     // Apple Health rows mirror the source SDNN. Health Connect RMSSD does not populate this column.
     val avgSdnn: Double? = null,
+    // Nightly ABSOLUTE skin temperature (°C): the wear-gated mean over the night's detected sleep, the
+    // value skinTempDevC is derived FROM (#1636). Appended LAST so the column order matches the Room
+    // CREATE TABLE and the Swift row. Distinct from skinTempDevC, which is bimodal — CSV/Health imports
+    // write an absolute wrist °C into that column and SkinTempDisplay separates them by magnitude. This
+    // one is unambiguous: always absolute, and only the strap pipeline writes it. Nullable: nights scored
+    // before v34 stay null until a re-score re-derives them from the same raw samples.
+    val skinTempC: Double? = null,
+    // Whether EVERY sleep session this day was staged from heart rate alone, with no motion to work from
+    // (#1801). The two vitals below it are not missing by accident on such a night: the HR-only spine
+    // constructs its sessions with restingHR and avgHRV null on purpose, because sleep bounds inferred
+    // from heart rate are not firm enough to hang a resting HR or a nightly RMSSD on, and AnalyticsEngine
+    // then gates both on `!hrOnly`. Persisted so the card can say WHICH of those it is — a blank next to
+    // a populated respiratory rate reads as a sync failure, and a field log showed a week of exactly that
+    // misreading. Appended LAST so the column order matches the Room CREATE TABLE and the Swift row.
+    // Null on every row scored before v36 and on any day with no sleep at all.
+    val sleepHrOnly: Boolean? = null,
 )
 
 /**
@@ -617,6 +634,28 @@ data class AppleStepHour(
 )
 
 /**
+ * PRD-K2: one persisted turn in the AI Coach conversation (Room v37 / MIGRATION_36_37). Swift
+ * `coachMessage` (WhoopStore Database.swift `v43-coach-messages` migration). Lets the Coach chat
+ * survive relaunch. `orderIndex` (not `createdAt`, which two streamed turns can share to the second)
+ * is a monotonically-increasing counter so replay order is exact. `provider` isn't filtered on for
+ * v1 (a conversation is a conversation across a provider switch) but is carried so a future
+ * per-provider view/filter doesn't need another migration. NEVER added to the `.noopbak` backup
+ * whitelist — a separate, deliberate decision (CLAUDE.md's backup contract).
+ *
+ * Fields are declared in the SAME order as the Swift GRDB schema (id, role, text, provider,
+ * createdAt, orderIndex) so the migration's CREATE TABLE column order matches Room's generated shape.
+ */
+@Entity(tableName = "coachMessage")
+data class CoachMessageRow(
+    @PrimaryKey val id: String,
+    val role: String,       // "user" | "assistant"
+    val text: String,
+    val provider: String,
+    val createdAt: Long,    // epoch seconds
+    val orderIndex: Int,    // monotonic replay order
+)
+
+/**
  * The RAW WHOOP 5.0 v26 optical PPG waveform, one record per second (v27 / MIGRATION_18_19, issue #156
  * follow-up). Swift `ppgWaveformSample` (WhoopStore Database.swift `v27-ppg-waveform` migration). The
  * strap's 24 Hz buffer was fully decoded but only ever used to derive [PpgHrSample]; the samples
@@ -630,6 +669,13 @@ data class AppleStepHour(
  * PK (deviceId, ts) mirrors every other per-second stream; a truncated frame can decode fewer than 24
  * samples. Fields are declared in the SAME order as the GRDB schema
  * (deviceId, ts, samples, burstIndex) so Room's generated shape stays byte-identical.
+ *
+ * CAPPED, not unbounded (#1911): [WhoopRepository.PPG_WAVEFORM_RETENTION_ROWS] rolling rows per device,
+ * the same shape [V18AuxSampleEntity] uses. The cap is NEWEST-N ROWS, never an age cutoff, and that is
+ * load-bearing for the paragraph above: a sporadic wearer's v26 seconds are spread thin over months, so
+ * dropping by wall-clock age would empty the table for exactly the user a future re-analysis needs most,
+ * and a waveform has no aggregate that survives it. Bounding the bytes while always leaving a full working
+ * set is the whole point. Swift twin: `WhoopStore.ppgWaveformRetentionRows`.
  */
 @Entity(tableName = "ppgWaveformSample", primaryKeys = ["deviceId", "ts"])
 data class PpgWaveformSampleEntity(
@@ -651,42 +697,6 @@ data class PpgWaveformSampleEntity(
         result = 31 * result + ts.hashCode()
         result = 31 * result + samples.contentHashCode()
         result = 31 * result + (burstIndex ?: 0)
-        return result
-    }
-}
-
-/**
- * One 1-second WHOOP 5/MG raw-IMU offload buffer (#423): 100 Hz 6-axis inertial data. [samples] is a
- * packed little-endian i16 BLOB of the six columns in wire order — ax×100, ay×100, az×100, gx×100, gy×100,
- * gz×100 (1200 bytes) — decoded by [com.noop.protocol.Whoop5RawImu] (scales 1/4096 g/LSB, 2000/32768 dps/
- * LSB). The strap already delivers this in the connect-time offload burst; capturing it needs NO arming.
- * Instrument-first + bounded: written only when raw capture is enabled, and pruned to a rolling recent
- * window ([WhoopRepository.RAW_IMU_RETENTION_ROWS]). Twin of the GRDB `rawImuSample` table. Natural key
- * (deviceId, ts) = one row per strap-second.
- *
- * CONSUMER STATUS (#978): deliberately none yet — instrument-first, the same stance as `v18AuxSample`. The
- * writer runs only with raw capture enabled + a 5/MG deep-data unlock; nothing scores, gates or shows a row.
- * The [WhoopRepository.rawImuSamples] / [WhoopDao.rawImuSamples] reader is intentionally dormant (zero
- * callers) — the eventual cross-check seam, NOT dead code, so do not delete it. The GRDB twin has no reader
- * yet by the same rule: one lands WITH a validated consumer, not before.
- */
-@Entity(tableName = "rawImuSample", primaryKeys = ["deviceId", "ts"])
-data class RawImuSampleEntity(
-    val deviceId: String,
-    val ts: Long,
-    val samples: ByteArray,
-) {
-    // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is RawImuSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
-    }
-
-    override fun hashCode(): Int {
-        var result = deviceId.hashCode()
-        result = 31 * result + ts.hashCode()
-        result = 31 * result + samples.contentHashCode()
         return result
     }
 }

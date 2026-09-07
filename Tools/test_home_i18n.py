@@ -96,6 +96,7 @@ ANDROID_INDIRECT_NON_UI_LITERALS = {
     "today.keyMetricsWindowDays", ",",
     # Stable DashboardCard raw values + preference; units remain measurement metadata.
     "stress", "fitnessAge", "vo2max", "vitality", "skinTemp", "sleep", "hydration", "coupled",
+    "coach",
     "today.dashboardCards", "yrs", "kcal", "",
 }
 
@@ -505,7 +506,9 @@ class HomeLocalizationTest(unittest.TestCase):
         self.assertNotIn('result.copy.contains("numbers agree")', (ROOT / "Strand/Screens/SkinTempCardsView.swift").read_text(encoding="utf-8"))
         self.assertIn('String(localized: "RHR +\\(delta)")', app_model)
         self.assertIn('String(localized: "HRV −\\(percent)%")', app_model)
-        self.assertIn('String(localized: "Skin temperature +\\(temperature) °C")', app_model)
+        # 240c48ae (#1671): the label now carries the reader's unit via UnitFormatter.skinTempSignalPhrase,
+        # so the sign and the hardcoded °C moved out of the localized literal.
+        self.assertIn('String(localized: "Skin temperature \\(temperature)")', app_model)
         self.assertIn('String(localized: "Respiration up")', app_model)
 
         self.assertIn("public enum Evidence", readiness)
@@ -521,7 +524,7 @@ class HomeLocalizationTest(unittest.TestCase):
 
         strings = audit.load_catalog(ROOT / "Strand/Resources/Localizable.xcstrings")["strings"]
         for key in (
-            "RHR +%lld", "HRV −%lld%%", "Skin temperature +%@ °C", "Respiration up",
+            "RHR +%lld", "HRV −%lld%%", "Skin temperature %@", "Respiration up",
             "%@ vs %@ %@", "7d %@ / 28d %@", "monotony %@",
         ):
             self.assertIn(key, strings)

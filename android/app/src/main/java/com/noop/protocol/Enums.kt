@@ -215,6 +215,10 @@ enum class CommandNumber(val rawValue: Int) {
     SET_DEVICE_CONFIG(119),
     START_RAW_DATA(81),
     STOP_RAW_DATA(82),
+    // WHOOP 5/MG realtime 6-axis IMU. The production WHOOP app sends revision 1 plus an enabled
+    // byte while a Strength Builder workout is active (hardware-captured on a normal WHOOP 5).
+    // NOOP exposes this only through the explicitly user-started Ground Truth collector.
+    TOGGLE_IMU_MODE(106),
     // GET_EXTENDED_BATTERY_INFO (98) — read-only extended battery read (mV etc.). The NUMBER is disputed
     // (#592): an independent APK decompile reads this family 11 lower (87), while whoomp's table says 98 —
     // partially supported by a real WHOOP 5 (fw 50.38.1.0) ANSWERING 98, though with a short stub that
@@ -223,6 +227,8 @@ enum class CommandNumber(val rawValue: Int) {
     // dumped in full to the strap log so a normal export settles which number this firmware serves.
     // Mirrors Swift WhoopCommand.getExtendedBatteryInfo.
     GET_EXTENDED_BATTERY_INFO(98),
+    /** The 5/MG battery pack's fuel gauge, read THROUGH the strap. A 4.0 never answers it. */
+    GET_BATTERY_PACK_INFO(151),
     // #690: read-only body-location/status probe. Documented in the WHOOP protocol; driven only by the
     // user-triggered, Test-Centre-gated probeBodyLocationAndStatus(). Decoded to a diagnostic report only.
     GET_BODY_LOCATION_AND_STATUS(84),

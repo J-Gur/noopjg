@@ -26,7 +26,7 @@ object AppChangelog {
      * Bump this when you add a release below. The "What's New" sheet shows automatically when the
      * stored last-seen version is behind this. (Decoupled from the bundle version on purpose.)
      */
-    const val CURRENT_VERSION = "10.5.0"
+    const val CURRENT_VERSION = "11.1.0"
 
     data class Release(
         val version: String,
@@ -37,6 +37,48 @@ object AppChangelog {
 
     /** Newest first. */
     val releases: List<Release> = listOf(
+        Release(
+            version = "11.1.0",
+            title = uiString(R.string.l10n_app_changelog_choose_a_12_hour_clock_sleep_8a19db5c),
+            date = "September 2026",
+            items = listOf(
+                "**Pick the clock you read times in (#1821).** Settings → Appearance now offers System, 12-hour or 24-hour. It defaults to System, so nothing changes unless you ask — and System now means your phone's own 24-hour switch, which NOOP was previously ignoring in favour of your region's default. A reader in a 24-hour country who prefers 12-hour had no way to say so.",
+                "**Sleep from a strap that records no motion (#1801).** A WHOOP 5/MG that never pairs banks no movement data, and sleep detection is built on stillness — so those nights scored as nothing at all. NOOP can now find a night from heart rate alone and stage it. It is display-only by design: an HR-only night never feeds your resting heart rate or HRV baselines, because it has not earned that.",
+                "**A charged strap is no longer told to charge (#1818).** The 1970/71 clock warning offered one remedy regardless of battery, so people at 100% were sent round a loop they had already run. It now says something true for a strap that is already charged, and asks for the log that can actually explain it.",
+                "**The coach can see your sleep stages (#1816).** It was answering that it had no access to them, because deep, REM and light minutes were never in what it was given. They are now, along with sleep efficiency.",
+                "**Back up a database larger than NOOP would restore (#1807).** Export warns when an archive is past the 2 GiB restore ceiling instead of writing it silently, and a restore can be allowed through rather than refused outright.",
+                "**Home-screen widget corrections (#1795, thanks @Sneheth; #1799).** The heart-rate and HRV values sat under each other's icons on Apple. Both platforms' widgets now also read properly aloud, with the value spoken rather than the raw number.",
+                "**Live workout no longer stacks two timers (#1814), and the steps card stops asking for the half you already gave it (#1815).**",
+                "**A strap log that reports rather than assumes (#1809, thanks @supremesynergy; #1823).** Every disconnect now records how long the link held and whether the strap sent anything at all, and the clock exchange quotes what the strap actually answered. NOOP used to write \"clock synced\" the moment it queued the write, before any reply existed — so a log could insist the clock was set while the screen said 1970/71.",
+                "**Oura rings with no name, and Android's heart-rate logging (#1797, thanks @pipiche38; #1796, thanks @kvnloo).**",
+            ),
+        ),
+        Release(
+            version = "11.0.0",
+            title = uiString(R.string.l10n_app_changelog_a_whoop_5_that_stays_connected_7b490eee),
+            date = "September 2026",
+            items = listOf(
+                "**The WHOOP 5.0 and MG stop dropping every few seconds (#1635, thanks @Zebsi235).** A handshake the strap never answers was knocking a perfectly good link down about every five seconds, all day. NOOP now recognises a strap that will not complete that handshake, stops attempting it, and holds the link instead — live heart rate keeps streaming rather than restarting forever. Tapping Connect costs one reconnect now, not five.",
+                "**Your body clock, on the Sleep screen (#1722, #1723, #1729, #1733).** A 24-hour dial showing when your body actually wants to sleep, and a chronotype read from your own nights rather than a questionnaire. It says what it used and refuses to guess when it cannot see enough.",
+                "**Nights read straighter (#1717, #1734, #1741, #1755, #1782).** A night that only partly downloaded is no longer scored as if it were whole. Sleep that arrives in fragments is stitched back together when your heart rate says you stayed asleep through the gap. And sleep debt is now a number you can act on tonight.",
+                "**A day you never logged is not a day you answered No (#322).** Journal insights compared days you ticked against every other day — including the ones you simply did not open the app. They now compare Yes days against No days only, so an untracked week stops quietly counting against you.",
+                "**NOOP tells you when there is a new version (#1674, #1675).** Both platforms now notice a release and say so, on by default, checked directly against the release feed with nothing else sent.",
+                "**Health Connect asks for one category at a time (#1509, thanks @kavemang).** Recovery, Activity and Body composition are chosen before Android's prompt appears, so you grant what you meant to. Existing installs keep exactly what they already had.",
+            ),
+        ),
+        Release(
+            version = "10.6.0",
+            title = uiString(R.string.l10n_app_changelog_an_effort_scale_you_choose_a_a7c2478d),
+            date = "August 2026",
+            items = listOf(
+                "**Pick how Effort is scored (#1562, #1563).** Banister TRIMP is now wired end to end and selectable, so Effort can follow the method you trust rather than the one that happened to ship. A workout is also scored against the same HRmax as the day containing it (#1565).",
+                "**The phone stops re-scoring all night (#1557, #1559).** A background re-score that could not finish used to restart from the beginning, forever. It now runs where it can complete, and the diagnostics say which pass ran and why — so days that quietly refused to compute now compute.",
+                "**The Oura ring is allowed to sleep (#1526, #1550, thanks @pipiche38).** Live-HR daytime mode was being held open whenever nobody was looking at the app, blocking the ring's own overnight sleep suite. NOOP now hands the ring back out of daytime mode, on suspend and on teardown.",
+                "**Sleep reads straighter (#1551, #1552, thanks @bartmuskala).** The Classic view draws the night's heart-rate line, and the stage breakdown is ramp-aware with the redundant legend gone.",
+                "**Pause or discard a live workout, and SDNN on Android (#1533, #1535, thanks @bhelm).** Live workouts gain pause and discard controls, and the SDNN index that was iOS-only is now on both platforms.",
+                "**Your strap's device key stays out of the strap log (#1610).** A WHOOP 4.0 identity response carries the strap serial and its device key side by side; the log now reports the structure and withholds the key, so a log attached to an issue no longer publishes it.",
+            ),
+        ),
         Release(
             version = "10.5.0",
             title = uiString(R.string.l10n_app_changelog_training_load_a_vo_max_without_f9205a67),

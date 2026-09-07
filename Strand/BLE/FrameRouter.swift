@@ -1,5 +1,6 @@
 import Foundation
 import WhoopProtocol
+import WhoopStore
 import StrandAnalytics
 
 /// Pure decode→state router. Takes a COMPLETE (already reassembled) frame, decodes it with
@@ -9,7 +10,19 @@ public final class FrameRouter {
     private let state: LiveState
     /// Called when the strap pushes an EVENT packet (WHOOP's strap-as-clock catch-up signal). The
     /// BLEManager wires this to a rate-limited requestSync(.strap). nil in pure/unit contexts.
+    /// #1193: the WHOOP 4.0 strap serial, decoded from the `GET_HELLO_HARVARD` (35) response. A 4.0 has
+    /// no DIS serial, so this is its only stable identity — see `Whoop4HelloSerial`. Fires on every hello;
+    /// the manager decides whether it is confirmed enough to adopt.
+    var onStrapSerial: ((String) -> Void)?
+
     var onSyncTrigger: (() -> Void)?
+    /// #1706: which strap this connection is talking to, so an alarm readback can be attributed to a
+    /// device. Set per connection by BLEManager immediately AFTER `family`, whose didSet clears this —
+    /// a path that sets the family and forgets the id then attributes nothing rather than carrying the
+    /// previous connection's strap forward, which is the very mistake this attribution exists to stop.
+    /// nil in pure/unit contexts, which the verdict treats as unattributed rather than guessing.
+    var deviceId: String?
+
     /// Which family's framing to decode with. Set per connection by BLEManager. WHOOP 5.0/MG frames
     /// use the CRC16/offset-8 envelope; the biometric field decode for puffin is still a stub, so
     /// WHOOP 5 custom frames currently surface only their envelope (live HR/battery come from the
@@ -18,12 +31,16 @@ public final class FrameRouter {
         // #900: a fresh connection is a fresh capture session — re-arm the per-command raw-frame dump so
         // each connect can re-capture the disputed COMMAND_RESPONSE prefix once. `family` is set fresh per
         // connection by BLEManager (connectCore), so this is the per-session reset hook.
-        didSet { rawDumpedRespCmds.removeAll() }
+        didSet { rawDumpedRespCmds.removeAll(); loggedFirmwareGate = nil; deviceId = nil }
     }
 
     /// #900: resp command names (e.g. "GET_BATTERY_LEVEL(26)") whose raw COMMAND_RESPONSE frame has already
     /// been dumped this connection. The provenance dump fires once per command per session so a 4.0's
     /// per-poll battery reads don't flood the strap log. Reset when `family` is set at connect.
+    /// #1634: last firmware-gate line logged, so a stable per-connection value is not repeated on every
+    /// hello. Cleared alongside the other per-connection routing state.
+    private var loggedFirmwareGate: String?
+
     private var rawDumpedRespCmds: Set<String> = []
 
     public init(state: LiveState) {
@@ -112,6 +129,14 @@ public final class FrameRouter {
                 // Persist so the debug export can name the firmware offline (state clears on disconnect).
                 UserDefaults.standard.set(fw, forKey: "noop.lastFirmware")
             }
+
+            // #1634: the 5/MG hello decoded no firmware. The guards fail closed by design, so this is the
+            // only place that can say WHY - a different generation byte vs a MOVED offset. Logged once per
+            // connection (the value is stable), so a capture from an undecoded strap carries the evidence.
+            if let gate = parsed.parsed["fw_gate"]?.stringValue, loggedFirmwareGate != gate {
+                loggedFirmwareGate = gate
+                state.append(log: gate, domain: .connection)
+            }
             // Advertising-name replies (WHOOP 4.0 / Harvard). GET (cmd 76) carries the current name in
             // its payload; SET (cmd 77) carries only a result byte. The schema has no field decode for
             // either, so pull them straight from the frame bytes. The COMMAND_RESPONSE inner is
@@ -136,6 +161,32 @@ public final class FrameRouter {
                 let accepted = (family == .whoop5) ? (r == 1) : (r == 0)
                 let verdict = r == nil ? "no result byte" : (accepted ? "accepted" : "REJECTED")
                 state.append(log: "reboot: strap acked result=\(rhex) (\(verdict))")
+            }
+            // #1823: the clock exchange, on BOTH families. NOOP wrote "clock synced" the instant it queued
+            // the writes and never read the answer, so a strap log asserted the clock was set while the
+            // readout said 1970/71 — two contradictory lines with nothing to separate them. Same
+            // accept/reject shape REBOOT_STRAP already uses: the family's own result offset and polarity
+            // (5/MG 1=SUCCESS, 4.0 0=SUCCESS). LOG-ONLY; it never gates behaviour.
+            if let cmd = parsed.cmdName, cmd.hasPrefix("SET_CLOCK") || cmd.hasPrefix("GET_CLOCK") {
+                // NO accept/reject verdict here, on EITHER family, and that is deliberate.
+                //
+                // 4.0's 0=accepted is the reboot probe's own explicitly UNVERIFIED reading. And on 5/MG
+                // the result byte may not exist at all for this command: the captured-frame fixture builds
+                // a puffin COMMAND_RESPONSE as [36, seq, cmd] + payload at offset 8, so @11 is already
+                // PAYLOAD and the @12 that `commandResultByte` reads is a payload byte, not a result code.
+                // REBOOT_STRAP's use of it was validated against reboot's own frames; nothing establishes
+                // it for the clock.
+                //
+                // Inventing a verdict from that is precisely the fault this line was added to fix - the
+                // old "clock synced" log asserted an outcome nobody had checked. So quote the evidence
+                // and let a maintainer decode it: the byte at the family's result offset, and the WHOLE
+                // frame (#900's format), uncapped. A truncated clock frame answers nothing, and the full
+                // frame is what makes a wrong offset assumption visible instead of silently misleading.
+                let r = Self.commandResultByte(in: frame, family: family)
+                let rhex = r.map { String(format: "0x%02x", UInt8(truncatingIfNeeded: $0)) } ?? "none"
+                state.append(log: "clock: \(cmd) reply byte@resultOffset=\(rhex) "
+                                + "frame=\(Self.fullFrameHex(frame))",
+                             domain: .connection)
             }
             if family == .whoop4, let cmd = parsed.cmdName {
                 if cmd.hasPrefix("GET_ADVERTISING_NAME_HARVARD") {
@@ -163,15 +214,41 @@ public final class FrameRouter {
                         // #34: persist what the strap reports so the debug export can show sent-vs-reported.
                         let d = UserDefaults.standard
                         d.set(Int(epoch), forKey: "alarm.lastReportedEpoch")
+                        // #1706: the strap this readback came from, and the bytes it came in. The raw
+                        // frame is what separates a genuinely-stored stale alarm from a misdecode of a
+                        // fixed response field, and the live log rolls long before a debug export is
+                        // taken — a 2045 readback went unexplained for exactly that reason.
+                        d.set(deviceId, forKey: "alarm.lastReportedDeviceId")
+                        d.set(raw, forKey: "alarm.lastReportedRaw")
                         d.set(Date().timeIntervalSince1970, forKey: "alarm.lastReportedAt")
                         // #34: count CONSECUTIVE rejections (reported ≠ what we last sent) — the signature of
                         // a corrupted strap alarm register. A matching readback resets it, so a transient
                         // (first read stale, then correct) never trips the warning; only a persistent refusal
                         // climbs. SmartAlarmView surfaces the warning at ≥2; the debug export shows the count.
                         // Observability only — never gates the BLE arm.
+                        // #1706: the streak raises a UI warning at two, so it must only COUNT a
+                        // disagreement PROVEN to be the same strap. A cross-strap reading is evidence of
+                        // nothing and leaves the streak alone — advancing would warn about a strap that
+                        // was never asked, clearing would hide a real refusal. An unattributed one is a
+                        // different case, handled below.
                         if let sent = d.object(forKey: "alarm.lastArmSentEpoch") as? Int {
-                            d.set(abs(Int(epoch) - sent) > 120 ? d.integer(forKey: "alarm.rejectStreak") + 1 : 0,
-                                  forKey: "alarm.rejectStreak")
+                            let verdict = AlarmReadback.verdict(
+                                sentEpoch: sent,
+                                reportedEpoch: Int(epoch),
+                                sentDeviceId: d.string(forKey: "alarm.lastArmDeviceId"),
+                                reportedDeviceId: deviceId)   // the local, not a re-read of what we just wrote
+                            if AlarmReadback.countsAsRejection(verdict) {
+                                d.set(d.integer(forKey: "alarm.rejectStreak") + 1, forKey: "alarm.rejectStreak")
+                            } else if AlarmReadback.clearsRejectionStreak(verdict) {
+                                d.set(0, forKey: "alarm.rejectStreak")
+                            } else if verdict == .unattributed {
+                                // Any streak standing here was built by the cross-strap comparison this
+                                // replaces, so it cannot be trusted — and since only a proven match clears
+                                // the streak now, leaving it would hold SmartAlarmView's warning up forever
+                                // on an install that upgraded mid-streak. Discard once; the next attributed
+                                // readback rebuilds it honestly.
+                                d.set(0, forKey: "alarm.rejectStreak")
+                            }
                         }
                     } else if Self.readbackReportsNoAlarm(in: frame) {
                         // #34 (issue comment 2026-07-12): the strap's "nothing armed" sentinel — the epoch
@@ -197,7 +274,7 @@ public final class FrameRouter {
                     let r = Self.commandResultByte(in: frame)
                     let rhex = r.map { String(format: "0x%02x", UInt8(truncatingIfNeeded: $0)) } ?? "none"
                     state.append(log: "Alarm: strap answered the arm (SET_ALARM_TIME) with result=\(rhex) — log-only, 4.0 result-code meaning unverified")
-                } else if cmd.hasPrefix("GET_HELLO_HARVARD"), TestCentre.active(.connection) {
+                } else if cmd.hasPrefix("GET_HELLO_HARVARD") {
                     // #1303: capture aid for WHOOP-4.0 stable-serial identity. The strap serial lives in this
                     // GET_HELLO_HARVARD (cmd 35) response. This used to dump the payload RAW, which answered
                     // the question — the serial is the 9-char alnum run at offset 14 — but a captured 4.0
@@ -213,10 +290,18 @@ public final class FrameRouter {
                     // the 5/MG device-name offset and means nothing in a cmd-35 payload — passing it would
                     // mislabel whatever run happened to start there. Log-only; decodes/persists nothing.
                     let helloPay = Self.commandResponsePayload(in: frame) ?? []
-                    state.append(log: HelloIdentityProbe.report(payload: helloPay,
-                                                                block: "HELLO_HARVARD(35)",
-                                                                knownNameOffset: -1)
-                                 + " — locate the strap serial offset (#1303)")
+                    // #1193: the identity read is UNGATED, unlike the probe below it. Adoption has to
+                    // work for every 4.0 user, and Test Centre is off for almost all of them — gating it
+                    // would ship a stable id only to the people already debugging. The decoder reads a
+                    // fixed 9-byte window and can never reach the device key beside it, so nothing here
+                    // widens what an ordinary session touches.
+                    if let serial = Whoop4HelloSerial.decode(payload: helloPay) { onStrapSerial?(serial) }
+                    if TestCentre.active(.connection) {
+                        state.append(log: HelloIdentityProbe.report(payload: helloPay,
+                                                                    block: "HELLO_HARVARD(35)",
+                                                                    knownNameOffset: -1)
+                                     + " — locate the strap serial offset (#1303)")
+                    }
                 }
             }
             // #1303: the 5/MG half of the same hunt. The 4.0 aid above is 4.0-only — correctly, since a
@@ -237,6 +322,31 @@ public final class FrameRouter {
                TestCentre.active(.connection),
                let pay = Self.commandResponsePayload(in: frame, family: family) {
                 state.append(log: HelloIdentityProbe.report(payload: pay) + " — locate the strap serial (#1303)")
+            }
+            // The 5/MG battery pack (cmd 151). `BatteryPackInfo` has decoded this reply since its offsets
+            // were captured, and until now nothing sent the command — so the decoder had no caller and the
+            // offsets have never been seen against a live strap.
+            //
+            // LOG-ONLY, deliberately. Those offsets are an unvalidated candidate re-derived from two
+            // frames, and a wrong one does not fail: it renders a confident wrong number. So this reports
+            // what it read AND whether the reading passes the `displayable` sanity check, which is exactly
+            // the evidence needed before a card can honestly show it. Test Centre → Connection gated, so
+            // nothing here reaches a default (shareable) strap log. Persists nothing.
+            if family == .whoop5, let cmd = parsed.cmdName, cmd.hasPrefix("GET_BATTERY_PACK_INFO("),
+               TestCentre.active(.connection) {
+                if let info = BatteryPackInfo.decode(frame: frame) {
+                    let soc = info.socPct.map { String(format: "%.1f%%", $0) } ?? "—"
+                    // logSafe, NOT the raw serial. `redactPii` cannot catch this one — its rules key on a
+                    // literal "WHOOP " prefix or a `whoop-` id, and a bare `serial=BB5AP…` matches neither —
+                    // so the redaction that protects the strap's serial would have let the pack's through to
+                    // an exportable log. Three characters is enough to tell two packs apart, which is all a
+                    // diagnostic needs.
+                    state.append(log: "[pack] present=\(info.present) soc=\(soc) "
+                                 + "serial=\(WhoopSerialIdentity.logSafe(serial: info.serial)) "
+                                 + "displayable=\(info.displayable) (#1303)")
+                } else {
+                    state.append(log: "[pack] cmd 151 replied but did not decode — offsets may have moved")
+                }
             }
             // #900: surface a non-SUCCESS COMMAND_RESPONSE on BOTH families (a result=UNSUPPORTED here is how
             // the MG haptics rejection #48 would show), and — the key part — annotate a reply that DELIVERED
@@ -276,6 +386,20 @@ public final class FrameRouter {
                     state.append(log: "  raw frame (#900 — [seq][result] provenance): \(Self.fullFrameHex(frame))")
                 }
             }
+
+        case "CONSOLE_LOGS":
+            // The 5/MG strap narrates its own sync engine here — "BLE: PullStats: Data: N, Events: N…",
+            // "History burst success. Trim: 0x…", "Historical Dump Complete". Android has mirrored this
+            // into the strap log since #78 and calls it gold for protocol research; this side decoded the
+            // text and then dropped it on the floor, so an Apple strap log has never carried a word of it.
+            //
+            // It is worth more than curiosity. `PullStats: Data: 0` is the STRAP stating it sent no
+            // records, which is a far stronger answer to a "synced but no data" report (#1683) than NOOP
+            // inferring emptiness from its own decode — the difference between the strap saying nothing
+            // was there and us saying we found nothing.
+            //
+            // Capped at 300 characters to match the Kotlin twin exactly; the ring buffer holds 2k lines.
+            appendStrapConsole(parsed)
 
         case "EVENT":
             if let ev = parsed.parsed["event"]?.stringValue {
@@ -320,6 +444,22 @@ public final class FrameRouter {
                 if ev.hasPrefix("CHARGING_ON") {
                     state.charging = true
                 } else if ev.hasPrefix("CHARGING_OFF") {
+                    state.charging = false
+                }
+                // #1826: BATTERY_PACK_CONNECTED(21) / BATTERY_PACK_REMOVED(22), declared in the shared
+                // schema and handled on neither platform until @Zebsi235 measured them. On a 5/MG they
+                // fire on every attach and detach and LEAD the 7/8 edges above, so the pill responds when
+                // a pack goes on instead of waiting to catch a later edge. A WHOOP 4.0 never sends them.
+                //
+                // NO replay guard here, unlike the Kotlin twin. That is deliberate and not an omission:
+                // this router is live-only — the Backfiller holds no reference to it, so a replayed
+                // offload event never reaches this code, which is the same reason the CHARGING_ON/OFF
+                // branch above carries none. Android's EVENT routing does see replays, and its capture
+                // showed the strap re-sending these edges with byte-identical payloads, so the gate is
+                // load-bearing THERE. Copying it here would guard against something that cannot happen.
+                if ev.hasPrefix("BATTERY_PACK_CONNECTED") {
+                    state.charging = true
+                } else if ev.hasPrefix("BATTERY_PACK_REMOVED") {
                     state.charging = false
                 }
                 // Physical inputs the strap exposes — live only (this path never sees historical
@@ -403,8 +543,14 @@ public final class FrameRouter {
 
     /// Space-separated lowercase hex of a COMMAND_RESPONSE payload, for the raw-hex diagnostic fallback
     /// when a readback payload doesn't decode. nil when the frame carries no payload.
-    nonisolated static func commandResponsePayloadHex(in frame: [UInt8]) -> String? {
-        guard let payload = commandResponsePayload(in: frame), !payload.isEmpty else { return nil }
+    /// #1823: takes `family` because `commandResponsePayload` slices at a family-specific inner offset
+    /// (5/MG 8, 4.0 its own). This wrapper used to drop the argument and always slice at the 4.0 offset,
+    /// so a 5/MG payload came back shifted - the same fixed-offset mistake the REBOOT_STRAP comment
+    /// records, and it would have mis-read the clock payload on the family the clock diagnostic is for.
+    /// Defaulted to `.whoop4` so the existing WHOOP4-gated alarm caller is unchanged.
+    nonisolated static func commandResponsePayloadHex(in frame: [UInt8],
+                                                      family: DeviceFamily = .whoop4) -> String? {
+        guard let payload = commandResponsePayload(in: frame, family: family), !payload.isEmpty else { return nil }
         return payload.map { String(format: "%02x", $0) }.joined(separator: " ")
     }
 
@@ -425,10 +571,12 @@ public final class FrameRouter {
     }
 
     /// Extract the armed-alarm epoch from a GET_ALARM_TIME (cmd 67) COMMAND_RESPONSE, defensively.
-    /// The WHOOP 4.0 response layout is UNDOCUMENTED, so this tries the two shapes the firmware could
-    /// plausibly answer with - the SET_ALARM_TIME mirror (`[form 0x01][u32 LE epoch]…`, matching the
-    /// 9-byte payload we arm with) first, then a bare leading u32 LE - and accepts a candidate only when
-    /// it passes `isPlausibleAlarmEpoch`. Anything else returns nil and the caller logs raw hex instead.
+    /// The WHOOP 4.0 response layout is UNDOCUMENTED, so this tries the shapes the firmware has been
+    /// seen to answer with - the 11-byte GET readback captured on fw 41.17.6.0
+    /// (`[form 0x01][stored flag][u32 LE epoch][00 00][04 00 20]`, epoch at offset 2) first, then the
+    /// SET_ALARM_TIME mirror (`[form 0x01][u32 LE epoch]…`, matching the 9-byte payload we arm with),
+    /// then a bare leading u32 LE - and accepts a candidate only when it passes
+    /// `isPlausibleAlarmEpoch`. Anything else returns nil and the caller logs raw hex instead.
     /// Pure and CoreBluetooth-free so golden tests pin it (AlarmReadbackDecodeTests).
     nonisolated static func armedAlarmEpoch(in frame: [UInt8]) -> UInt32? {
         guard let payload = commandResponsePayload(in: frame) else { return nil }
@@ -439,14 +587,29 @@ public final class FrameRouter {
                 | (UInt32(payload[i + 2]) << 16)
                 | (UInt32(payload[i + 3]) << 24)
         }
+        // The GET readback (fw 41.17.6.0, three arm/readback captures 2026-08-26..28, #34/#1706): the
+        // epoch sits ONE byte further than in the SET mirror, because the readback carries a stored
+        // flag (0x00 = nothing stored, 0x01 = stored) the arm payload does not. The mirror-offset read
+        // of this shape returns the epoch's LOW THREE bytes shifted up a byte, plus the flag — wrong
+        // by roughly 256x and free to land anywhere in u32 range. In all three captures it landed on
+        // a 2045 date INSIDE the 2017..2100 plausibility window (an arm for 2026-08-26 read back as
+        // 2045-09-24), so the gate did not catch it and a MISMATCH was counted against a strap whose
+        // register is fine. So on this shape the mirror offsets are known-wrong and must NOT be tried:
+        // offset 2 decodes, or the payload falls to the raw-hex line.
+        if payload.count == 11, payload.first == 0x01 {
+            if let e = u32le(at: 2), isPlausibleAlarmEpoch(e) { return e }
+            return nil
+        }
         if payload.first == 0x01, let e = u32le(at: 1), isPlausibleAlarmEpoch(e) { return e }
         if let e = u32le(at: 0), isPlausibleAlarmEpoch(e) { return e }
         return nil
     }
 
     /// True when a GET_ALARM_TIME readback explicitly reports NO alarm stored — the epoch field decodes
-    /// to 0 in the same shapes `armedAlarmEpoch` reads (SET-mirror `[0x01][u32=0]` first, then a bare
-    /// leading `u32=0`). This is the strap's "nothing armed" sentinel, distinct from a genuinely
+    /// to 0 in the same shapes `armedAlarmEpoch` reads (the 11-byte GET readback `[0x01][flag][u32=0]…`
+    /// first — the #34 field-report payload `01 00 00 00 00 00 00 00 04 00 20` is exactly this shape
+    /// with the stored flag 0x00 — then the SET-mirror `[0x01][u32=0]`, then a bare leading `u32=0`).
+    /// This is the strap's "nothing armed" sentinel, distinct from a genuinely
     /// unparseable payload: an arm the strap silently dropped reads back as epoch 0, so labelling it
     /// "unrecognised" hid the real signal (#34). Only consulted AFTER `armedAlarmEpoch` returns nil, so a
     /// plausible armed epoch never reaches here. Pure/CoreBluetooth-free so AlarmReadbackDecodeTests pin it.
@@ -459,6 +622,7 @@ public final class FrameRouter {
                 | (UInt32(payload[i + 2]) << 16)
                 | (UInt32(payload[i + 3]) << 24)
         }
+        if payload.count == 11, payload.first == 0x01, let e = u32le(at: 2) { return e == 0 }
         if payload.first == 0x01, let e = u32le(at: 1) { return e == 0 }
         if let e = u32le(at: 0) { return e == 0 }
         return false
@@ -497,6 +661,32 @@ public final class FrameRouter {
     /// RTC (fix #72) — a live gesture is ~now in the strap's clock, a historical replay is old in it.
     /// Deliberately does NOT touch lastEvent / sync trigger / bonded / battery — those stay on the normal
     /// handle(frame:) path, so backfill UI behaviour is otherwise unchanged.
+    /// Mirror a CONSOLE_LOGS frame's text even during a backfill.
+    ///
+    /// The strap narrates its sync engine EXACTLY while offloading — "BLE: PullStats: Data: N",
+    /// "History burst success. Trim: 0x…", "Historical Dump Complete" — and offload frames are routed
+    /// straight to the Backfiller, bypassing `handle` entirely. So the `case "CONSOLE_LOGS"` there only
+    /// ever sees the rare console frame that arrives outside a sync, which is not the one worth having.
+    /// This is the same carve-out `dispatchLiveGestureIfFresh` makes for a live gesture mid-offload.
+    ///
+    /// Same cheap pre-check as that method: a single type-byte compare skips the CRC + FieldBuilder
+    /// decode for the thousands of type-47 records a sync produces, so the cost on the offload path is a
+    /// byte compare per frame. Family-aware (WHOOP4 type @[4], 5/MG @[8]).
+    func mirrorStrapConsoleIfPresent(frame: [UInt8]) {
+        guard frameTypeName(frame, family: family) == "CONSOLE_LOGS" else { return }
+        let parsed = parseFrame(frame, family: family)
+        guard parsed.ok, parsed.crcOK != false else { return }
+        appendStrapConsole(parsed)
+    }
+
+    /// The one place the strap's own narration reaches the log, so the live and offload paths cannot
+    /// drift in what they emit. Capped at 300 characters to match the Kotlin twin exactly.
+    private func appendStrapConsole(_ parsed: ParsedFrame) {
+        guard parsed.typeName == "CONSOLE_LOGS",
+              let txt = parsed.parsed["log"]?.stringValue, !txt.isEmpty else { return }
+        state.append(log: "strap: \(String(txt.prefix(300)))")
+    }
+
     func dispatchLiveGestureIfFresh(frame: [UInt8], now: Int = Int(Date().timeIntervalSince1970)) {
         // #47: this fires for EVERY frame on the OFFLOAD path (thousands of type-47 records over a
         // multi-minute sync) purely to catch a rare EVENT gesture. Cheap type-only pre-check skips the full

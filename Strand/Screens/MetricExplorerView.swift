@@ -182,6 +182,18 @@ func vo2MaxAttributionSource(_ estimator: Vo2MaxEstimator?) -> String {
     vo2MaxAttributionPrefix + (estimator?.rawValue ?? "unknown")
 }
 
+/// Will the chart show a visible break in this VO₂max trend?
+///
+/// Derived from `vo2MaxTrendSegmentIds` rather than recomputed, so the caption and the segmentation can
+/// never disagree. A GAP IN DAYS under one estimator is still a single segment and draws no break, so it
+/// correctly gets no caption: a break means the readings were not produced alike, not that the data
+/// paused. Named for the BREAK: an untagged legacy reading resolves to "...estimator:unknown", so an
+/// unknown -> Nes transition splits the line while the method itself may never have changed.
+/// Kotlin twin `vo2MaxTrendHasBreak`.
+func vo2MaxTrendHasBreak(days: [String], sourceByDay: [String: String]) -> Bool {
+    Set(vo2MaxTrendSegmentIds(days: days, sourceByDay: sourceByDay)).count > 1
+}
+
 /// Sequential segment ids for the VO₂max trend. The counter matters when a user changes Nes → Uth → Nes:
 /// using the method name alone would reconnect the two non-adjacent Nes runs across the Uth interval.
 func vo2MaxTrendSegmentIds(days: [String], sourceByDay: [String: String]) -> [String] {
@@ -252,6 +264,32 @@ private let readingShortDateFormatter: DateFormatter = {
     f.dateFormat = "d MMM"
     return f
 }()
+
+// MARK: - Skin-temp explorer notes (#1847 / #1848)
+
+/// Whether the skin-temp explorer must explain that it fell back to deviations despite the
+/// user's Settings choice asking for temperatures. Twin of Android's `shouldExplainSkinTempFallback`.
+///
+/// True only when the user asked for absolute, the screen is NOT leading with absolutes, and NO
+/// night in the window carries one — so the fallback is total, not partial. A window with one
+/// stored temperature and twenty deltas still leads with temperatures (the #1850 window-wide rule),
+/// so this note stays silent there; it fires only when the setting genuinely cannot be honoured.
+func shouldExplainSkinTempFallback(prefer: SkinTempDisplay.Kind, leadsAbsolute: Bool,
+                                   anyAbsoluteInWindow: Bool) -> Bool {
+    prefer == .absolute && !leadsAbsolute && !anyAbsoluteInWindow
+}
+
+/// Whether the skin-temp explorer must explain that deviation-only nights were dropped from the
+/// series when leading with absolutes. Twin of Android's `shouldExplainShortenedSkinTempSeries`.
+///
+/// True ONLY when leading with the absolute — the deviation-led branch also drops rows (calibrating
+/// nights that have only an absolute, and the #622 bimodal partition), but those are the OPPOSITE
+/// kind, so this note's sentence would be precisely backwards there. True only when rows were
+/// actually dropped, so a complete series stays silent.
+func shouldExplainShortenedSkinTempSeries(leadsAbsolute: Bool, shownReadings: Int,
+                                          rowsWithEitherNumber: Int) -> Bool {
+    leadsAbsolute && shownReadings < rowsWithEitherNumber
+}
 
 // MARK: - Root: categorized list
 
@@ -526,11 +564,18 @@ struct MetricDetailView: View {
     // Effort display scale (#268) — routes the Effort metric's numbers + unit; display-only, the plotted
     // series stays 0–100. Every other metric is scale-agnostic (see MetricDescriptor.format).
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
+    /// #1846/#1848: which skin-temp number the explorer leads with — absent/`""` = a temperature
+    /// (the default), or `SkinTempDisplay.Kind.deviation.rawValue` to lead with the ±baseline move.
+    /// Same key as Today/Health/Settings; display-only, nothing stored ever changes.
+    @AppStorage(UnitPrefs.skinTempDisplayKey) private var skinTempDisplayRaw = ""
     private var unitSystem: UnitSystem { UnitSystem(rawValue: unitSystemRaw) ?? .metric }
     private var temperatureUnit: TemperatureUnit {
         UnitPrefs.resolveTemperature(system: unitSystem, override: temperatureRaw)
     }
     private var effortScale: EffortScale { UnitPrefs.resolveEffortScale(effortScaleRaw) }
+    private var skinTempPreferred: SkinTempDisplay.Kind {
+        SkinTempDisplay.Kind(rawValue: skinTempDisplayRaw) ?? .absolute
+    }
     private func fmt(_ v: Double) -> String {
         metric.format(v, system: unitSystem, temperature: temperatureUnit, effortScale: effortScale)
     }
@@ -557,6 +602,13 @@ struct MetricDetailView: View {
     /// reads it, so it can lag the rest of the screen by a second without anyone noticing.
     @State private var correlationsLoaded = false
 
+    /// #1848: the skin-temp explorer's explanatory note (nil when none is needed). Set in `load()`
+    /// alongside the series, from the same `repo.days` scan that decides which kind to lead with.
+    /// Two notes, mutually exclusive: (1) the user asked for temperatures but the window has none,
+    /// so deviations are shown instead; (2) leading with absolutes dropped deviation-only nights
+    /// from the series. Both are real on Apple — the same two cases the Android twin carries.
+    @State private var skinTempNote: String? = nil
+
     /// Cached correlation scan, keyed by its inputs (selected range + the metric id),
     /// so the full cross-catalog Pearson sweep runs ONLY when those change — not on
     /// every body re-eval (hover / 1 Hz HR ticks / animation). Recomputed from
@@ -564,7 +616,7 @@ struct MetricDetailView: View {
     @State private var correlationCache: [CorrRow] = []
     /// The (metricID, range) the cache was built for; nil means "not yet computed".
     @State private var correlationKey: String? = nil
-    private var loadTaskID: String { "\(metric.id)|\(repo.refreshSeq)" }
+    private var loadTaskID: String { "\(metric.id)|\(repo.refreshSeq)|\(skinTempDisplayRaw)" }
 
     // MARK: Derived
 
@@ -734,6 +786,23 @@ struct MetricDetailView: View {
                     // with the range pill. Then the frosted chart / stat tiles / correlations.
                     heroHeader(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
                     heroChart(effectiveRange: effRange, windowed: win, windowFellBack: fellBack)
+                    // #1848: the skin-temp explorer's explanatory note (nil for every other metric and
+                    // for a skin-temp screen that needs no explanation). Sits between the chart and the
+                    // stats so it reads as context for the series just plotted, not as a generic banner.
+                    if let note = skinTempNote {
+                        NoopCard {
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: "info.circle")
+                                    .font(.system(size: 14, weight: .medium))
+                                    .foregroundStyle(StrandPalette.textTertiary)
+                                    .accessibilityHidden(true)
+                                Text(note)
+                                    .font(StrandFont.footnote)
+                                    .foregroundStyle(StrandPalette.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
                     statRow(effectiveRange: effRange, windowed: win)
                     readingsTable(windowed: win)
                     correlationCard
@@ -838,6 +907,81 @@ struct MetricDetailView: View {
                     sourceByDay[point.day] = spo2CandidateAttributionSource
                 }
                 series = byDay.sorted { $0.key < $1.key }.map { (day: $0.key, value: $0.value) }
+            }
+        }
+        // #1848: skin-temp explorer — give it a skin-temp-specific branch mirroring the Android
+        // `buildVitalDetail` "skin" case, rather than the shared `dailyColumn` → `skinTempDevC` path.
+        //
+        // The shared mapper returns `skinTempDevC` only, so the explorer never leads with the measured
+        // absolute (`skinTempC`) and ignores the Settings choice (#1846). Repointing `dailyColumn`'s
+        // `skin_temp` case would change which series Trends plots and what the band is computed against
+        // (its callers include the trend series and the metric-catalog availability check), so the fix
+        // is a branch HERE, not a change to the shared mapper.
+        //
+        // The preference applies across the WINDOW (#1850), not just the newest row: a wearer with
+        // twenty stored temperatures and one recent night without saw twenty-three deltas — the setting
+        // says Temperature and the app HAS temperatures. `leadReading`'s rule lifted to the window: the
+        // chosen kind wins whenever any night carries it, the other is still the fallback, so a choice
+        // can never empty the screen.
+        //
+        // An absolute may live in EITHER column (#622: a WHOOP CSV import writes absolute °C into
+        // `skinTempDevC`), so both count here and in the series below.
+        skinTempNote = nil
+        if metric.key == "skin_temp" {
+            let days = repo.days
+            let anyAbsolute = days.contains { row in
+                row.skinTempC != nil
+                    || row.skinTempDevC.map(VitalBands.isAbsoluteSkinTemp) == true
+            }
+            let anyDeviation = days.contains { row in
+                row.skinTempDevC.map { !VitalBands.isAbsoluteSkinTemp($0) } == true
+            }
+            if anyAbsolute || anyDeviation {
+                let leadsAbsolute: Bool
+                switch skinTempPreferred {
+                case .absolute:   leadsAbsolute = anyAbsolute
+                case .deviation:  leadsAbsolute = !anyDeviation && anyAbsolute
+                }
+                if leadsAbsolute {
+                    // An absolute-led series takes EVERY absolute reading, whichever column holds it.
+                    // `skinTempC` is the on-device computed absolute; `skinTempDevC` may hold a CSV-imported
+                    // absolute (#622 bimodal). Mixing is only unsound ACROSS scales; these are the same scale.
+                    series = days.compactMap { row in
+                        let v = row.skinTempC
+                            ?? row.skinTempDevC.flatMap { VitalBands.isAbsoluteSkinTemp($0) ? $0 : nil }
+                        return v.map { (day: row.day, value: $0) }
+                    }.sorted { $0.day < $1.day }
+                } else {
+                    // Genuine deviations only — an imported absolute sitting in `skinTempDevC` belongs to
+                    // the other scale and is excluded, exactly as before.
+                    series = days.compactMap { row in
+                        row.skinTempDevC.flatMap { !VitalBands.isAbsoluteSkinTemp($0) ? $0 : nil }
+                            .map { (day: row.day, value: $0) }
+                    }.sorted { $0.day < $1.day }
+                }
+                // Rebuild sourceByDay for the new series. `DailyMetric` has no per-row deviceId on Apple
+                // (the merged cache doesn't carry one), so every reading attributes to the metric's own
+                // source — the same source the `exploreSeries` daily-column layer would have used.
+                sourceByDay = Dictionary(series.map { ($0.day, metric.source) },
+                                         uniquingKeysWith: { first, _ in first })
+                // The two #1847 notes — both cases exist on Apple too:
+                // (1) Settings asked for a temperature and none of these nights has one → say so, because
+                //     silently falling back is why the setting reads as broken. Nights scored before
+                //     `skinTempC` shipped kept only the deviation; a scoring pass refills them.
+                // (2) Leading with the absolute drops deviation-only nights from the series — which can
+                //     now include the most recent one. Say why rather than letting history look like it
+                //     vanished. (Deviation-led drops are the OPPOSITE kind, so the note is gated to
+                //     absolute-led only — see `shouldExplainShortenedSkinTempSeries`.)
+                let shownReadings = series.count
+                let rowsWithEither = days.count { $0.skinTempC != nil || $0.skinTempDevC != nil }
+                if shouldExplainSkinTempFallback(prefer: skinTempPreferred, leadsAbsolute: leadsAbsolute,
+                                                 anyAbsoluteInWindow: anyAbsolute) {
+                    skinTempNote = String(localized: "No measured temperature for these nights — showing the difference from your baseline instead. A re-score refills temperatures for nights that have one.")
+                } else if shouldExplainShortenedSkinTempSeries(leadsAbsolute: leadsAbsolute,
+                                                                shownReadings: shownReadings,
+                                                                rowsWithEitherNumber: rowsWithEither) {
+                    skinTempNote = String(localized: "Only nights with a measured temperature are shown — the others only have a baseline difference.")
+                }
             }
         }
         // #943 selection seam: a locked default (.month with under a week of history) no longer
@@ -1074,11 +1218,31 @@ struct MetricDetailView: View {
                 valueFormat: { fmt($0) }
             )
         } footer: {
-            ChartFooter([
-                ("Window", effectiveRange.label),
-                ("Points", "\(windowed.count)"),
-                ("Latest", heroValue),
-            ])
+            // #1662: the VO₂max line is SPLIT on purpose wherever the estimator changes, so two
+            // non-adjacent Nes runs are never joined across an incompatible Uth stretch. Nothing said so,
+            // and a silent gap in a trend is indistinguishable from a rendering fault — it was reported
+            // as "something weird with a broken line". Shown only when a break actually exists, so it
+            // explains the chart in front of the reader rather than a behaviour they cannot see.
+            //
+            // In the FOOTER, not beside the chart: `ChartCard` applies `chart().frame(height:)` to that
+            // whole closure, so a caption in there would be squeezed into the chart's fixed height and
+            // steal space from the line it is explaining. The footer is the only full-height slot under
+            // the chart. Android places it directly under the plot because its card has no such frame -
+            // feature parity, not pixel parity.
+            VStack(alignment: .leading, spacing: 8) {
+                if metric.key == "vo2max_est",
+                   vo2MaxTrendHasBreak(days: windowed.map(\.day), sourceByDay: sourceByDay) {
+                    Text("The line breaks where the estimation method changed or was not recorded.")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ChartFooter([
+                    ("Window", effectiveRange.label),
+                    ("Points", "\(windowed.count)"),
+                    ("Latest", heroValue),
+                ])
+            }
         }
     }
 
@@ -1179,7 +1343,14 @@ struct MetricDetailView: View {
         let readings = windowed.map {
             VitalReading(day: $0.day, value: $0.value, source: sourceByDay[$0.day] ?? metric.source)
         }
-        let rows = vitalReadingRows(readings: readings, unit: metric.unit,
+        // The unit is passed EMPTY on purpose (#1942). `vitalReadingRows` appends its `unit` to whatever
+        // the formatter returns, and every `MetricDescriptor.format` overload already ends in the unit —
+        // the CONVERTED one, at that. Passing `metric.unit` here rendered "33 % %", and worse than a
+        // repeat for the three convertible families, whose stored label contradicts the displayed one:
+        // "182.0 lb kg", "Δ0.5 °F °C", "12.5 /21 /100". The Android twin appends the same way and is
+        // correct because every one of its call sites passes a UNIT-LESS closure; iOS has no unit-less
+        // formatter that also converts, so the unit comes from `fmt` and the parameter stays empty.
+        let rows = vitalReadingRows(readings: readings, unit: "",
                                     strapDeviceId: repo.deviceId, format: fmt)
         if !rows.isEmpty {
             NoopCard {

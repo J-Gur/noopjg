@@ -6,6 +6,16 @@ import StrandDesign
 /// natural analogue is a `TabView` with the most-used screens as tabs and everything else under a
 /// "More" list. Every screen is the same `StrandDesign`-built view the macOS app uses.
 struct RootTabView: View {
+    /// #1841: shared with Android by NAME and meaning, not by storage — the two platforms keep their own
+    /// stores, exactly as the Clock format setting does.
+    ///
+    /// Default FALSE here while Android defaults true, and the divergence is deliberate. Apple's forums
+    /// report `.tabBarMinimizeBehavior(.onScrollDown)` failing to trigger in tabs built on
+    /// `NavigationStack(path:)` — which is every primary tab in this file, bound deliberately so a tab
+    /// root can pop and re-scroll. So this may well be inert on our structure, and defaulting ON would
+    /// advertise a behaviour that never happens. Off until someone confirms it on an iOS 26 device.
+    @AppStorage("noop.bottomBarAutoHide") private var bottomBarAutoHide = false
+
     /// External entry points must wait until the mandatory first-run gates have completed. The root owns
     /// that state; keeping it explicit here prevents this shell's window-level sheet from covering a gate.
     let homeScreenQuickActionsEnabled: Bool
@@ -32,12 +42,12 @@ struct RootTabView: View {
     /// root view alive, so an at-root re-tap keeps scroll position and never re-runs `.task`
     /// (#198; the #197 resetID/`.id()` rebuild reset both). Requires the tab roots' first-hop
     /// links to push `TabRoute`/`MoreDestination` VALUES — closure-destination links bypass the path.
-    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: 4)
+    @State private var tabPaths: [NavigationPath] = Array(repeating: NavigationPath(), count: 5)
     /// One scroll-to-top token per tab. Bumped when the user re-taps the active tab while it's ALREADY
     /// at its root — the other half of the iOS convention #197/#198 left unserved (an at-root re-tap was
     /// a no-op). Threaded into each tab's root via `\.scrollToTopSignal`; ScreenScaffold / LiquidTodayView
     /// scroll to their top anchor when their tab's token changes.
-    @State private var scrollTop: [Int] = Array(repeating: 0, count: 4)
+    @State private var scrollTop: [Int] = Array(repeating: 0, count: 5)
     /// Which More-tab groups are expanded (S2). Insights + Body stay open at rest; Data + App collapse to
     /// just their header until tapped. Persisted (#860 item 2): the user's open/closed choice must SURVIVE
     /// leaving and re-entering the More tab (and relaunch), not reset to the seed every visit. Backed by an
@@ -95,7 +105,7 @@ struct RootTabView: View {
                 guard selectedTab != 0 else { return }
                 let dx = v.translation.width, dy = v.translation.height
                 guard abs(dx) > 60, abs(dx) > abs(dy) * 1.6 else { return }
-                let next = min(3, max(0, selectedTab + (dx < 0 ? 1 : -1)))
+                let next = min(4, max(0, selectedTab + (dx < 0 ? 1 : -1)))
                 if next != selectedTab {
                     withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = next }
                 }
@@ -110,9 +120,16 @@ struct RootTabView: View {
             tab(todayTabRoot, "Today", "square.grid.2x2", path: $tabPaths[0], scrollSignal: scrollTop[0]).tag(0)
             tab(TrendsView(), "Trends", "chart.line.uptrend.xyaxis", path: $tabPaths[1], scrollSignal: scrollTop[1]).tag(1)
             tab(SleepView(), "Sleep", "bed.double", path: $tabPaths[2], scrollSignal: scrollTop[2]).tag(2)
-            moreTab(path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
+            // K3: Coach promoted to a top-level tab (was behind the More list). The sparkles icon
+            // matches the More-tab row and the macOS sidebar entry.
+            tab(CoachView(), "Coach", "sparkles", path: $tabPaths[3], scrollSignal: scrollTop[3]).tag(3)
+            moreTab(path: $tabPaths[4], scrollSignal: scrollTop[4]).tag(4)
         }
         .tint(StrandPalette.accent)
+        // #1841: the same "Hide bar when scrolling" preference Android drives its own bar with. Here the
+        // system owns the behaviour — iOS 26's tab bar MINIMISES to a pill on scroll down rather than
+        // sliding away entirely, so this is the platform's read of the same intent, not a copy of ours.
+        .noopTabBarAutoHide(bottomBarAutoHide)
             // Tab crossfade — README §Motion: ~240ms opacity swap between tab roots, global calm
             // easing cubic-bezier(0.22,1,0.36,1).
             .animation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24), value: selectedTab)
@@ -172,6 +189,11 @@ struct RootTabView: View {
             case .insightsHub, .labBook, .fusedRecord, .rhythm:
                 routedPillar = dest
                 router.requestedDestination = nil
+            case .coach:
+                // K3: Coach is now a top-level tab (tag 3) — switch to it directly instead of
+                // presenting it as a pillar sheet.
+                withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = 3 }
+                router.requestedDestination = nil
             case .trends:
                 // Trends is a primary tab on iPhone (not a pillar sheet) — switch to it.
                 withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = 1 }
@@ -186,6 +208,11 @@ struct RootTabView: View {
                 // Live Sessions is presented from Today's own Start entry (a cover, not a routed sheet),
                 // so a deep-link lands on the Today tab where that entry lives.
                 withAnimation(.timingCurve(0.22, 1, 0.36, 1, duration: 0.24)) { selectedTab = 0 }
+                router.requestedDestination = nil
+            case .coach:
+                // #1862: the Today Coach launcher hands its question here. Coach is a pillar sheet on
+                // iPhone, the same as the Insights hub, so route it that way rather than switching tabs.
+                routedPillar = dest
                 router.requestedDestination = nil
             case .journal:
                 // The #627 Today journal widget opens the journal through the quick-action Journal sheet
@@ -248,6 +275,8 @@ struct RootTabView: View {
                 case .fusedRecord: FusedRecordHost()
                 case .rhythm: RhythmHost(onClose: { routedPillar = nil })
                 case .devices: DevicesView()
+                // K5: the scheduled morning-brief notification's tap-through target.
+                case .coach: CoachView()
                 // .trends is never presented as a pillar sheet on iPhone (it's a primary tab — the
                 // requestedDestination handler switches `selectedTab` instead), but the switch must stay
                 // exhaustive. Fall back to Trends inside the sheet host if it ever arrives here.
@@ -261,6 +290,9 @@ struct RootTabView: View {
                 // .journal opens through the quick-action Journal sheet (handled above); this keeps the
                 // switch exhaustive and falls back to the journal's Insights host if it ever reaches here.
                 case .journal: InsightsView()
+                // #1862: Coach IS presented here — the launcher sheet routes to it as a pillar, so unlike
+                // the fallbacks above this arm is the real destination, not a safety net.
+                case .coach: CoachView()
                 }
             }
             // The Trends/Today fallbacks above emit TabRoute value pushes (#198), which need a
@@ -387,7 +419,7 @@ struct RootTabView: View {
                 moreSection("Insights") {
                     MoreRow("What Moves You", "wand.and.sparkles", .insightsHub)
                     MoreRow("Intelligence", "brain.head.profile", .intelligence)
-                    MoreRow("Coach", "sparkles", .coach)
+                    // K3: Coach promoted to a top-level tab — no longer listed under More.
                     MoreRow("Insights", "lightbulb.fill", .insights)
                     MoreRow("Explore", "square.grid.2x2.fill", .explore)
                     MoreRow("Compare", "rectangle.split.2x1.fill", .compare)
@@ -686,3 +718,25 @@ private struct QuickActionSheet: View {
 }
 
 #endif
+
+/// #1841: apply the iOS 26 tab-bar minimise behaviour, doing nothing on older systems.
+///
+/// The availability branch is deliberately the ONLY branch. `RootTabView` already documents what happens
+/// when a condition that flips at runtime wraps this `TabView`: #519 put two states in separate
+/// `_ConditionalContent` branches, and every navigation rebuilt the whole subtree, resetting `@State`
+/// inside the tab roots — scroll offsets, chart ranges, expanded sections.
+///
+/// So the preference must NOT select between branches. It selects the modifier's ARGUMENT, while the
+/// availability check — fixed for the life of the process — is what picks a branch. Toggling the setting
+/// changes a value, never the view's identity.
+extension View {
+    @ViewBuilder
+    func noopTabBarAutoHide(_ enabled: Bool) -> some View {
+        if #available(iOS 26.0, *) {
+            // `.onScrollDown` minimises to a pill on downward scroll; `.never` pins it fully visible.
+            self.tabBarMinimizeBehavior(enabled ? .onScrollDown : .never)
+        } else {
+            self
+        }
+    }
+}

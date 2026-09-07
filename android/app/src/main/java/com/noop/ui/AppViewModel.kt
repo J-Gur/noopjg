@@ -13,6 +13,7 @@ import com.noop.analytics.Baselines
 import com.noop.analytics.IllnessSignalEngine
 import com.noop.analytics.IllnessWatch
 import com.noop.analytics.IntelligenceEngine
+import com.noop.analytics.DayCycleIntelligenceIntegration
 import com.noop.analytics.CircadianEngine
 import com.noop.analytics.V5HealthSignals
 import com.noop.analytics.RegistryDayOwnerSource
@@ -49,10 +50,10 @@ import com.noop.notif.StrainTargetNotifier
 import com.noop.notif.ScheduledReportPolicy
 import com.noop.notif.scorePctOrNull
 import com.noop.protocol.CommandNumber
-import com.noop.server.WorkoutServerService
 import com.noop.widget.WidgetSnapshot
 import com.noop.widget.WidgetSnapshotStore
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withTimeoutOrNull
@@ -62,6 +63,9 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.flowOn
+import kotlinx.coroutines.flow.flatMapLatest
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.isActive
@@ -127,18 +131,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val ble = noopApp.ble
 
     val repo: WhoopRepository get() = repository
-
-    /** Phase 2 (local workout-control web server): publish this instance so [WorkoutServerService]'s
-     *  HTTP handler — which cannot hold a ViewModel reference of its own — can reach [startWorkout] /
-     *  [endWorkout] for a request coming from another device on the LAN. Cleared in [onCleared], so a
-     *  server request arriving after the Activity is gone gets an honest "app not open" response
-     *  instead of touching a dead instance. Starting the server here (not at process start) keeps it on
-     *  the same safe, always-foreground call path [WhoopConnectionService] already uses, and means the
-     *  control page only becomes reachable once the app has actually been opened. */
-    init {
-        ActiveAppViewModel.current = this
-        WorkoutServerService.start(appContext)
-    }
 
     /** The registry's active strap id (the same id the read path resolves to). The getter stays source
      * compatible for existing call sites; reactive screens collect [activeStrapIdFlow]. */
@@ -267,12 +259,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         noopApp.deviceRegistry.rename(id, nickname)
 
     /** Permanently delete all of a device's recorded data (its registry row is kept). */
-    suspend fun deletePairedDeviceData(id: String) = noopApp.deviceRegistry.deleteDeviceData(id)
+    suspend fun deletePairedDeviceData(id: String) {
+        if (com.noop.testcentre.ImuSessionFileStore(getApplication()).deleteDevice(id))
+            noopApp.deviceRegistry.deleteDeviceData(id)
+    }
 
     /** Permanently forget a device: wipe all its recorded data AND remove its registry entry, so a
      *  duplicate/stale strap disappears from the list entirely (an archived row could otherwise only be
      *  re-activated or data-wiped, never purged — #1193). Twin of Swift `DeviceRegistry.forget`. */
-    suspend fun forgetPairedDevice(id: String) = noopApp.deviceRegistry.forget(id)
+    suspend fun forgetPairedDevice(id: String) {
+        if (com.noop.testcentre.ImuSessionFileStore(getApplication()).deleteDevice(id))
+            noopApp.deviceRegistry.forget(id)
+    }
 
     /**
      * A DISCOVERY-ONLY [StandardHrSource] for the Add-a-strap wizard. It runs its OWN scan and never
@@ -285,7 +283,8 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             context = appContext,
             deviceId = "scan-preview",
             liveSink = { _, _ -> },
-            persist = { _, _ -> },
+            // Discovery-only scanner: nothing is persisted, so the outcome callback never fires.
+            persist = { _, _, _ -> },
             // Route the throwaway scanner's diagnostics into the SAME exported strap log the active path
             // uses (issue #421 parity), so a tester's wizard scan is captured. The source self-prefixes
             // "HR-strap: "; [externalLog] redacts addresses. Privacy-safe: statuses / counts only.
@@ -445,15 +444,37 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  recordings under a read pinned to the literal "my-whoop" (#814 twin of the Workouts screen). */
     val deviceId = noopApp.activeDeviceId
 
-    /** Last (bins, daysObserved) computed on the collector pass. Reused by the SYNCHRONOUS settings
-     *  re-evaluate below, which has no coroutine to read the store from — without this, flipping the
+    /** Last (bins, daysObserved) computed on the collector pass. Reused by the cycle-tracking
+     *  re-evaluates below so they need no store read of their own — without this, flipping the
      *  cycle-tracking toggle would blank the body clock until the next collector tick.
+     *
+     *  Those sites now go through [freshCircadianBins], which reads the store ONLY when this cache is
+     *  empty, and they sit inside `viewModelScope.launch`. On `Dispatchers.Main.immediate` a body that
+     *  never suspends runs inline, so the populated-cache path is as immediate as the plain call it
+     *  replaced; only the empty-cache case actually defers. (This comment previously said the
+     *  re-evaluate was SYNCHRONOUS and had no coroutine — true before that change, not after.)
      *
      *  Not volatile and not synchronised, deliberately: the write resumes on `viewModelScope`
      *  (Dispatchers.Main.immediate) and the read is a UI-thread settings callback, so both touch it on
      *  the main thread. The Swift twin gets the same guarantee from `@MainActor` on AppModel. */
     private var lastCircadianBins: Pair<List<CircadianEngine.ActivityBin>, Int> =
         emptyList<CircadianEngine.ActivityBin>() to 0
+
+    /**
+     * The circadian bins, re-read first if the cache is empty.
+     *
+     * Only the main collect path refreshed [lastCircadianBins]; the cycle-tracking paths reused whatever
+     * was cached, which starts as `emptyList() to 0` and returns to empty whenever a store read fails
+     * (`circadianActivityBins` swallows that to an empty list). Either way a cycle re-evaluation would
+     * then hand `V5HealthSignals` no bins, drop below its six-bin floor, and null out `bodyClock` — the
+     * Health card disappearing on a device whose data is fine, which is exactly the symptom that started
+     * this. Refreshing only when EMPTY keeps the cheap path cheap: a populated cache is left alone and
+     * the collector stays the thing that keeps it current.
+     */
+    private suspend fun freshCircadianBins(): Pair<List<CircadianEngine.ActivityBin>, Int> {
+        if (lastCircadianBins.first.isEmpty()) lastCircadianBins = circadianActivityBins()
+        return lastCircadianBins
+    }
 
     /**
      * Per-hour activity profile for the body clock (#852), from the last ~14 days of hourly HR buckets.
@@ -618,6 +639,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _phoneAlarmEnabled = MutableStateFlow(phoneAlarmStore.enabled)
     /** Whether the phone smart alarm is armed (a guaranteed OS alarm is scheduled). */
     val phoneAlarmEnabled: StateFlow<Boolean> = _phoneAlarmEnabled.asStateFlow()
+    /** #1858: per-weekday wake-time overrides for the PHONE alarm — the strap alarm's #554 feature,
+     *  which this screen has shown beside it since then. Empty = every enabled day uses the single time. */
+    private val _phoneAlarmDayOverrides = MutableStateFlow(phoneAlarmStore.targetOverrides)
+    val phoneAlarmDayOverrides: StateFlow<Map<Int, Int>> = _phoneAlarmDayOverrides.asStateFlow()
+
     private val _phoneAlarmTargetMinutes = MutableStateFlow(phoneAlarmStore.targetMinutes)
     /** Earliest acceptable wake time, minutes since midnight. */
     val phoneAlarmTargetMinutes: StateFlow<Int> = _phoneAlarmTargetMinutes.asStateFlow()
@@ -696,6 +722,33 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Vitality windows) keeps its data. Same oldest-first ordering as before.
         repository.recentDaysMergedFlow(deviceId)
             .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    /**
+     * Today's measured steps follow the newest confirmed sleep-onset cycle, independently of the fixed
+     * 04:00 presentation day used by the rest of the dashboard. The marker is persisted by the analytics
+     * pass, so this survives process death and a delayed sleep detection can switch the tile retroactively.
+     */
+    @OptIn(ExperimentalCoroutinesApi::class)
+    internal val activeDayCycle: StateFlow<ActiveDayCycle?> = activeStrapIdFlow
+        .map { effectiveActiveStrapId(it, deviceId) }
+        .distinctUntilChanged()
+        .flatMapLatest { activeId ->
+            repository.recentDaysMergedFlow(activeId).flatMapLatest days@{ days ->
+                if (days.isEmpty()) return@days flowOf(null)
+                val from = days.first().day
+                val to = days.last().day
+                combine(
+                    repository.computedDailyUnionFlow(activeId, from, to),
+                    repository.metricSeriesComputedUnionFlow(
+                        activeId, DayCycleIntelligenceIntegration.ONSET_KEY, from, to,
+                    ),
+                ) { computed, markers ->
+                    resolveActiveDayCycle(days, computed, markers, System.currentTimeMillis() / 1_000L)
+                }
+            }
+        }
+        .flowOn(Dispatchers.IO)
+        .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), null)
 
     /**
      * #103: SpO₂ candidate @82 nightly mean per day, loaded from the "spo2_candidate" metricSeries
@@ -823,6 +876,46 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             ble.connectedPeripheralAddress
                 .collect { addr -> noopApp.sourceCoordinator.connectedPeripheralChanged(addr) }
+        }
+        // #1303: the 5/MG DIS read hands up the strap's OWN serial, so re-point this pairing from its
+        // transient address-based id onto a stable `whoop-<serial>` id, through the SAME migration the ring
+        // already uses (#771) — a re-pair or factory reset then stops forking one physical strap into a
+        // second row and orphaning its history (#1193). Lives here rather than in SourceCoordinator, which
+        // is deliberately inert on the WHOOP path and never touches WhoopBleClient internals; this class
+        // already owns the registry handle and a scope. Twin of Swift `BLEManager.adoptWhoopSerialIdentity`.
+        //
+        // A WHOOP 4.0 reaches here by a different road: it exposes no DIS serial, so its serial is decoded
+        // from the GET_HELLO_HARVARD response (`Whoop4HelloSerial`) and handed to this same callback only
+        // after a SECOND sighting of the same value — see `WhoopBleClient.noteHarvardSerial` for why a 4.0
+        // waits where a 5/MG adopts on the first read (#1193).
+        ble.onSerial = { serial ->
+            viewModelScope.launch {
+                val serialId = com.noop.data.WhoopSerialIdentity.adoptedId(serial)
+                val currentId = deviceRegistry.activeDeviceId()
+                // Idempotent: once adopted the id already equals the serial id, so a reconnect costs one
+                // string compare and no database work. A serial WhoopSerialIdentity refuses (blank,
+                // truncated, non-serial prose) leaves the strap on its existing id — adopting onto a junk id
+                // would migrate every device-scoped row onto a garbage key, worse than not adopting at all.
+                if (serialId != null && currentId != null && currentId != serialId &&
+                    com.noop.data.WhoopSerialIdentity.mayAdopt(currentId) &&
+                    deviceRegistry.adoptSerialIdentity(currentId, serialId)
+                ) {
+                    // Prefix only. `serialId` embeds the full serial, which must never reach a shared log.
+                    ble.logIdentity(
+                        "WHOOP: adopted stable serial identity (serialPrefix=" +
+                            com.noop.data.WhoopSerialIdentity.logSafe(serial) +
+                            ") - history re-pointed off the transient pairing id (#1303)",
+                    )
+                    deviceRegistry.setActive(serialId)
+                    // The process-wide handle too, not just the registry and the coordinator. It is read
+                    // by the diagnostics export and threaded into the BLE client and the source
+                    // coordinator at startup; leaving it behind meant the engine kept deriving days under
+                    // the PRE-adoption id until the next cold start, splitting the computed history across
+                    // both ids (field-confirmed on a 5/MG before this line existed).
+                    noopApp.onActiveDeviceAdopted(serialId)
+                    noopApp.sourceCoordinator.onActiveDeviceChanged(serialId)
+                }
+            }
         }
         // Re-arm the strap's firmware alarm once per process-alive day. The firmware alarm is a single
         // absolute instant with NO recurrence and was previously re-armed ONLY on the bond edge — so a
@@ -1011,10 +1104,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
                 // #836 parity (Android): the 15-min tick is a backstop, not a data-driven refresh. Every real
                 // update (sync, import, edit, recalibrate, the #547 heal above) rescores via its own path and
-                // moves the raw-HR fingerprint, so skip the heavy 21-day rescore when the HR stream is unchanged
+                // moves the complete raw-input fingerprint, so skip the heavy 21-day rescore when every scoring stream is unchanged
                 // since the last COMPLETED run. Mirrors the Swift analyzeRecent(force:false) gate; the watermark
                 // advances only on success (below), so an interrupted run can never hide unscored data.
-                val analyzeFp = repository.hrFingerprint()
+                val analyzeFp = repository.analysisFingerprint()
                 // #1538: attribute the tick that is about to run. An idle-tick pass previously emitted NO
                 // trigger line at all — a "re-score: done" with nothing before it — so a strap log could not
                 // be read by pairing trigger->done, and a stalled background pass was easy to misattribute to
@@ -1026,6 +1119,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val analyzeHasNewData = analyzeFp != NoopPrefs.analyzeWatermark(appContext)
                 if (analyzeHasNewData) ble.externalLog("re-score: trigger=idle newData=yes")
                 if (analyzeHasNewData) runCatching {
+                    // #1816: set the motion sink before the pass so the Today tile can name the right
+                    // missing half (motion, not phone steps) when none has arrived yet. Cleared after.
+                    IntelligenceEngine.stepsHasMotionSink = { hasMotion ->
+                        profileStore.stepsHasBankedMotion = hasMotion
+                    }
                     IntelligenceEngine.analyzeRecent(
                         repo = repository,
                         profile = currentProfile(),
@@ -1128,12 +1226,26 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                         // persists the nightly @82 mean as "spo2_candidate" in metricSeries.
                         spo2CandidateDisplay = NoopPrefs.spo2CandidateDisplay(appContext),
                         effortMethod = NoopPrefs.effortMethod(appContext),
+                        dayCycleMode = NoopPrefs.dayCycleMode(appContext),
                     )
                     // analyzeRecent now hops to Dispatchers.Default; a scope cancellation surfaces as a
                     // CancellationException that runCatching would otherwise swallow, breaking the loop's
                     // own cancellation — rethrow it so onCleared() actually stops the loop. (#125)
-                }.onSuccess { NoopPrefs.setAnalyzeWatermark(appContext, analyzeFp) }
+                }.onSuccess {
+                    NoopPrefs.setAnalyzeWatermark(appContext, analyzeFp)
+                    // #1735: the watermark says WHAT was scored, never WHEN. "re-score: done" goes only to
+                    // the live log, so hours later the rolling buffer has dropped it and an export cannot
+                    // tell a pass that ran from one that never did - which is half of "my ride still is not
+                    // showing". Stamp the completion; AndroidDiagnostics renders it beside "Data write".
+                    runCatching {
+                        NoopPrefs.of(appContext).edit()
+                            .putLong("score.lastPassAt", System.currentTimeMillis() / 1000).apply()
+                    }
+                }
                     .onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+                // #1816: clear the motion sink after the pass completes (success or failure) so a stale
+                // callback is never left behind. The next pass sets its own before calling analyzeRecent.
+                IntelligenceEngine.stepsHasMotionSink = null
                 // Opt-in writeback: push the freshly computed nights into Health Connect so other
                 // apps see them. Idempotent (clientRecordId per metric+day), so re-running every
                 // cycle just upserts. Never let an HC hiccup (perm revoked mid-flight, provider
@@ -1726,6 +1838,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     private suspend fun rescoreAfterEdit() {
         runCatching {
+            // #1816: set the motion sink before the pass, clear it after (same pattern as the 15-min loop).
+            IntelligenceEngine.stepsHasMotionSink = { hasMotion ->
+                profileStore.stepsHasBankedMotion = hasMotion
+            }
             IntelligenceEngine.analyzeRecent(
                 repo = repository,
                 profile = currentProfile(),
@@ -1756,11 +1872,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 // #103: SpO₂ candidate @82 display toggle — same flag the 15-min loop reads.
                 spo2CandidateDisplay = NoopPrefs.spo2CandidateDisplay(appContext),
                 effortMethod = NoopPrefs.effortMethod(appContext),
+                dayCycleMode = NoopPrefs.dayCycleMode(appContext),
             )
         }.onFailure { if (it is kotlin.coroutines.cancellation.CancellationException) throw it }
+        IntelligenceEngine.stepsHasMotionSink = null
     }
-
-    /** Re-read every source + the dismissed markers and republish [workouts]. */
     fun loadWorkouts() {
         viewModelScope.launch {
             val now = System.currentTimeMillis() / 1000
@@ -2109,6 +2225,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearBodyLocationProbe() = ble.clearBodyLocationProbe()
 
+    /** Read-only battery-pack probe (cmd 151) — asks the strap for its pack's charge, serial and BT
+     *  address. User-initiated, Test-Centre-gated in DevicesScreen; the decoded report goes to the
+     *  dialog + strap log only, and feeds no live state. 5/MG only in practice (a 4.0 has no pack
+     *  command), and whether a 5/MG answers at all is the hardware question being asked. */
+    fun probeBatteryPackInfo() = ble.probeBatteryPackInfo()
+
+    /** cmd-151 probe result text (null until a reply lands; waiting sentinel while in flight). */
+    val batteryPackProbe = ble.batteryPackProbe
+
+    fun clearBatteryPackProbe() = ble.clearBatteryPackProbe()
+
     /** #761: READ-ONLY feature-flag ENUMERATION probe (117 then repeated 118) — reads the flag NAMES the
      *  strap's own firmware knows and writes nothing (no SET_FF_VALUE, no value of any kind).
      *  User-initiated, Test-Centre-gated in DevicesScreen; the report goes to the dialog + strap log. */
@@ -2343,8 +2470,11 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 val granted = runCatching {
                     HealthConnectImporter.client(appContext).permissionController.getGrantedPermissions()
                 }.getOrDefault(emptySet())
+                val selectedPermissions = HealthConnectImporter.permissionsFor(
+                    HealthConnectImporter.selectedCategories(appContext),
+                )
                 // Partial permissions are fine (#150): auto-import as long as at least one type is granted.
-                if (granted.none { it in HealthConnectImporter.PERMISSIONS }) return@withContext false
+                if (granted.none { it in selectedPermissions }) return@withContext false
                 // Pass the profile height so the importer can derive BMI (Health Connect has no BMI record).
                 runCatching { HealthConnectImporter.import(appContext, repository, profileStore.heightCm) }.isSuccess
             }
@@ -2466,10 +2596,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _phoneAlarmTargetMinutes.value = phoneAlarmStore.targetMinutes
         if (phoneAlarmStore.enabled) SmartAlarmScheduler.arm(appContext, phoneAlarmStore)
         // The wind-down nudge is derived from the wake time, so keep it in step.
-        if (windDownStore.enabled) WindDownScheduler.schedule(appContext, windDownStore, phoneAlarmStore.targetMinutes)
+        if (windDownStore.enabled) WindDownScheduler.schedule(
+            appContext, windDownStore, phoneAlarmStore.targetMinutes, phoneAlarmStore.targetOverrides,
+        )
         // #536: re-arm the strap at the new earliest time when "Buzz WHOOP 4" is on. Routed through the
         // single reconciler so it can't clobber a smart-alarm the user still has on (#5).
         reconcileStrapAlarm()
+    }
+
+    /**
+     * #1858: set or clear ONE weekday's wake-time override for the phone alarm.
+     *
+     * `null` clears, so a day can go back to following the single time without a second control. Re-arms
+     * afterwards for the same reason every other alarm edit does: the scheduled deadline is computed from
+     * these values, so leaving it stale would keep waking the user at the old time until something else
+     * happened to re-arm. Mirrors `setSmartAlarmDayOverride` for the strap.
+     */
+    fun setPhoneAlarmDayOverride(dayOfWeek: Int, minutes: Int?) {
+        val next = phoneAlarmStore.targetOverrides.toMutableMap()
+        if (minutes == null) next.remove(dayOfWeek) else next[dayOfWeek] = minutes
+        phoneAlarmStore.targetOverrides = next
+        _phoneAlarmDayOverrides.value = phoneAlarmStore.targetOverrides
+        if (phoneAlarmStore.enabled) SmartAlarmScheduler.arm(appContext, phoneAlarmStore)
+        // The strap-buzz companion derives its buzz time FROM the phone alarm, so an override that moves a
+        // wake time has to move the buzz with it. `setPhoneAlarmWeekdays` already reconciles for exactly
+        // this reason; omitting it here would leave the strap armed for the old time until some unrelated
+        // edit happened to reconcile — a strap buzzing at the wrong hour being worse than one not buzzing.
+        reconcileStrapAlarm()
+        // The wind-down nudge is anchored to the wake time this just moved, so it has to move too —
+        // Apple's WindDownNudge has fanned out per-day since #554. Without this the reminder keeps
+        // pointing at the old wake on exactly the day the user changed.
+        if (windDownStore.enabled) {
+            WindDownScheduler.schedule(
+                appContext, windDownStore, phoneAlarmStore.targetMinutes, phoneAlarmStore.targetOverrides,
+            )
+        }
     }
 
     /** Set the days the phone alarm fires on. EMPTY = every day (see [SmartAlarmStore.weekdays]).
@@ -2510,7 +2671,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setWindDownEnabled(enabled: Boolean) {
         windDownStore.enabled = enabled
         _windDownEnabled.value = enabled
-        if (enabled) WindDownScheduler.schedule(appContext, windDownStore, phoneAlarmStore.targetMinutes)
+        if (enabled) WindDownScheduler.schedule(
+            appContext, windDownStore, phoneAlarmStore.targetMinutes, phoneAlarmStore.targetOverrides,
+        )
         else WindDownScheduler.cancel(appContext)
     }
 
@@ -2537,16 +2700,21 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun setCycleTrackingEnabled(enabled: Boolean) {
         _cycleTrackingEnabled.value = enabled
         NoopPrefs.setCycleTracking(appContext, enabled)
-        val days = recentDays.value
-        runCatching {
-            _v5Signals.value = V5HealthSignals.evaluate(
-                days = days,
-                cycleOptedIn = enabled,
-                loggedPeriodStarts = _periodStarts.value,
-                journalContext = illnessJournalContext(days),
-                activityBins = lastCircadianBins.first,
-                daysObserved = lastCircadianBins.second,
-            )
+        // Launched, like the sibling toggles, because the bins may need a store read before this snapshot
+        // is safe to publish — evaluating straight off an empty cache is what erased `bodyClock`.
+        viewModelScope.launch {
+            val days = recentDays.value
+            val bins = freshCircadianBins()
+            runCatching {
+                _v5Signals.value = V5HealthSignals.evaluate(
+                    days = days,
+                    cycleOptedIn = enabled,
+                    loggedPeriodStarts = _periodStarts.value,
+                    journalContext = illnessJournalContext(days),
+                    activityBins = bins.first,
+                    daysObserved = bins.second,
+                )
+            }
         }
     }
 
@@ -2564,6 +2732,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      *  which the toggle's own copy promises. Twin of the iOS onChange handler. */
     fun setBanisterEffort(enabled: Boolean) {
         NoopPrefs.setBanisterEffort(appContext, enabled)
+        viewModelScope.launch { rescoreAfterEdit() }
+    }
+
+    /** Change the shared boundary used by additive daily metrics and immediately rebuild affected rows. */
+    fun setDayCycleMode(mode: com.noop.analytics.DayCycleMode) {
+        NoopPrefs.setDayCycleMode(appContext, mode)
         viewModelScope.launch { rescoreAfterEdit() }
     }
 
@@ -2598,13 +2772,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val starts = store.starts()
         _periodStarts.value = starts
         val days = recentDays.value
+        val bins = freshCircadianBins()
         _v5Signals.value = V5HealthSignals.evaluate(
             days = days,
             cycleOptedIn = _cycleTrackingEnabled.value,
             loggedPeriodStarts = starts,
             journalContext = illnessJournalContext(days),
-            activityBins = lastCircadianBins.first,
-            daysObserved = lastCircadianBins.second,
+            activityBins = bins.first,
+            daysObserved = bins.second,
         )
     }
 
@@ -2668,12 +2843,20 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         } else null
         // Buzz-WHOOP-4 companion's requested time: the phone alarm's EARLIEST wake time, next occurrence
         // ON A DAY THAT ALARM ACTUALLY FIRES. This routes through the same weekday-aware resolver the
-        // smart alarm uses (with no per-day overrides — the phone alarm has none) rather than
-        // nextDailyEpochSec, which is unconditionally daily: leaving it daily would buzz the strap on a
-        // morning the phone alarm is switched off, which is precisely the day the user asked to sleep in.
-        // An empty weekday set still means every day, so the default behaviour is unchanged.
+        // smart alarm uses rather than nextDailyEpochSec, which is unconditionally daily: leaving it daily
+        // would buzz the strap on a morning the phone alarm is switched off, which is precisely the day the
+        // user asked to sleep in. An empty weekday set still means every day.
+        //
+        // #1858: the per-day overrides go through TOO. This companion exists to buzz the strap at the phone
+        // alarm's earliest wake time, so a day whose wake time was moved must move the buzz with it — the
+        // comment here used to say "the phone alarm has none", which stopped being true the moment it got
+        // them, and a strap buzzing at the old time is worse than one not buzzing at all.
         val buzzEpoch = if (_buzzWhoop4Enabled.value) {
-            nextSmartAlarmEpochSec(phoneAlarmStore.targetMinutes, phoneAlarmStore.weekdays)
+            nextSmartAlarmEpochSec(
+                phoneAlarmStore.targetMinutes,
+                phoneAlarmStore.weekdays,
+                dayOverrides = phoneAlarmStore.targetOverrides,
+            )
         } else null
 
         val epochSec = earliestStrapAlarmEpochSec(smartEpoch, buzzEpoch)
@@ -2838,14 +3021,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // convenience (read your strap HR on nearby gym kit), not a background service. A relaunch
         // re-resumes it from the persisted toggle.
         broadcaster.stop()
-        // Phase 2 workout-control server: only this ViewModel's own registration counts as "still
-        // live" — a newer Activity's AppViewModel may already have replaced the pointer by the time
-        // this one is torn down (e.g. a fast re-create), and clearing it here would wrongly orphan
-        // the new instance's server requests.
-        if (ActiveAppViewModel.current === this) {
-            ActiveAppViewModel.current = null
-            WorkoutServerService.stop(appContext)
-        }
     }
 
     private companion object {
@@ -2869,18 +3044,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         /** SharedPreferences key for the persisted double-tap action (stored as the enum NAME). */
         const val DOUBLE_TAP_ACTION_KEY = "noop.doubleTapAction"
     }
-}
-
-/**
- * Holds the currently-live [AppViewModel] instance, for background entry points that cannot hold a
- * ViewModel reference of their own — currently only [com.noop.server.WorkoutHttpServer], which runs
- * on a plain [android.app.Service] with no ViewModelStoreOwner. Set in [AppViewModel]'s init and
- * cleared in [AppViewModel.onCleared], so [current] is null whenever no Activity is hosting the
- * ViewModel (e.g. the app was swiped away) — callers MUST treat null as "app not open" rather than
- * assuming it is always reachable.
- */
-object ActiveAppViewModel {
-    @Volatile var current: AppViewModel? = null
 }
 
 /**
@@ -3025,9 +3188,14 @@ internal fun earliestStrapAlarmEpochSec(smartEpoch: Long?, buzzEpoch: Long?): Lo
 
 /**
  * Elapsed-workout clock from a whole-second count: M:SS up to an hour, H:MM:SS once an hour has passed (so a
- * 90-minute session reads "1:30:00", not "90:00"). Negative inputs clamp to zero ("0:00"). Pure so the
- * Today "workout in progress" indicator and the Live card share ONE format, and the iOS-parity H:MM:SS
- * roll-over is unit-testable without composing any UI. Mirrors iOS ActiveWorkoutIndicatorModel.elapsed.
+ * 90-minute session reads "1:30:00", not "90:00"). Negative inputs clamp to zero ("0:00"). Pure so every
+ * surface showing an in-flight workout — the Today card, the Live card, the Workouts-tab banner and the
+ * full-screen live screen — shares ONE format, and the iOS-parity H:MM:SS roll-over is unit-testable
+ * without composing any UI.
+ *
+ * Twin of Swift `ActiveWorkoutClock.clock`. (It used to name ActiveWorkoutIndicatorModel.elapsed, which
+ * no longer owns the formatting — that now delegates, like everything else, so the reference moved with
+ * the code rather than being left pointing at a caller.)
  */
 internal fun elapsedClock(elapsedS: Long): String {
     val total = elapsedS.coerceAtLeast(0)

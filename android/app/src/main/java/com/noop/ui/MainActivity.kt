@@ -10,7 +10,15 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -18,6 +26,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -25,10 +37,13 @@ import androidx.core.view.WindowCompat
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.noop.BuildConfig
+import com.noop.CrashCapture
 import com.noop.NoopApplication
+import com.noop.R
 import com.noop.ble.WhoopModel
 import com.noop.data.DemoSeeder
 import com.noop.data.WhoopRepository
+import com.noop.push.SelfHostedPushScheduler
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.awaitClose
@@ -56,6 +71,24 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         WindowCompat.setDecorFitsSystemWindows(window, false)
+        // NOTE: `crash` stays RAW here on purpose. acknowledge() fingerprints what it is given, and
+        // pendingCrash() fingerprints the stored file — hand it redacted text and the two hashes never
+        // match, so the screen would reappear on every launch forever, which is precisely the loop the
+        // fingerprint exists to prevent. Masking happens where it is SHOWN and COPIED, inside the screen.
+        CrashCapture.pendingCrash(this)?.let { crash ->
+            setContent {
+                NoopTheme {
+                    CrashRecoveryScreen(
+                        crash = crash,
+                        onContinue = {
+                            CrashCapture.acknowledge(this, crash)
+                            recreate()
+                        },
+                    )
+                }
+            }
+            return
+        }
         // Load the saved "Card transparency" so every frosted card renders at the chosen opacity from launch.
         CardAppearance.init(this)
 
@@ -85,6 +118,9 @@ class MainActivity : ComponentActivity() {
         // feature is off). Wrapped because a WorkManager hiccup must never block launch.
         runCatching { DebugExportScheduler.reschedule(applicationContext) }
 
+        // K5: self-heal the scheduled Coach morning-brief job (no-op when off / already scheduled).
+        runCatching { CoachBriefScheduler.reschedule(applicationContext) }
+
         // Backup & Sync (#791): self-heal the daily auto-backup schedule (no-op when off / no folder),
         // and run a DEFERRED on-launch catch-up backup. Must-fix #4: the catch-up is gated on the toggle
         // being ON, runs fully off the main thread on Dispatchers.IO, and is launched AFTER the
@@ -93,6 +129,12 @@ class MainActivity : ComponentActivity() {
         runCatching { BackupSync.reschedule(applicationContext) }
         lifecycleScope.launch(Dispatchers.IO) {
             runCatching { BackupSync.catchUpIfDue(applicationContext) }
+        }
+
+        // Experimental self-hosted push: launch only queues a catch-up when fully configured and
+        // enabled. The Activity never reads health rows, credentials, or performs network I/O.
+        lifecycleScope.launch(Dispatchers.IO) {
+            runCatching { SelfHostedPushScheduler.enqueueLaunchCatchUp(applicationContext) }
         }
 
         // Load the Light/Dark/System + chart-colour preferences before first composition so the theme
@@ -107,6 +149,7 @@ class MainActivity : ComponentActivity() {
         // Decode the optional custom background image (if set) + its toggles before first composition so
         // the backdrop is right from the first frame on every tab. No-op when no image is set.
         BackgroundImageStore.load(this)
+        BottomBarStyleStore.load(this)   // #1836: bottom-bar layout choice, default the shipped slot
 
         setContent {
             NoopTheme {
@@ -132,6 +175,36 @@ class MainActivity : ComponentActivity() {
         }.toTypedArray()
 
         if (needed.isNotEmpty()) permissionLauncher.launch(needed)
+    }
+}
+
+@Composable
+private fun CrashRecoveryScreen(crash: String, onContinue: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    // Masked for the two paths that leave the device — the visible trace and the clipboard. The stored
+    // file stays verbatim for anything that needs it, and the acknowledgement fingerprint is taken on
+    // the raw text by the caller. redactStrapLogPii is the same sink the strap log and the test bundle
+    // use (BLE MACs and WHOOP serials) and is documented as total, so it cannot throw here. A BLE
+    // exception carrying a device address is exactly its shape, and this screen's copy button exists
+    // to paste into public bug reports.
+    val shown = remember(crash) { com.noop.ble.redactStrapLogPii(crash) }
+    Surface(Modifier.fillMaxSize(), color = Palette.surfaceBase) {
+        Column(
+            Modifier.padding(horizontal = 20.dp, vertical = 32.dp).verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Text(stringResource(R.string.crash_recovery_title), style = NoopType.title1, color = Palette.textPrimary)
+            Text(stringResource(R.string.crash_recovery_body), style = NoopType.body, color = Palette.textSecondary)
+            Button(onClick = { clipboard.setText(AnnotatedString(shown)) }) {
+                Text(stringResource(R.string.crash_recovery_copy))
+            }
+            Button(onClick = onContinue) {
+                Text(stringResource(R.string.crash_recovery_continue))
+            }
+            SelectionContainer {
+                Text(shown, style = NoopType.caption, color = Palette.textSecondary)
+            }
+        }
     }
 }
 
@@ -185,6 +258,19 @@ object NoopPrefs {
 
     /** "Keep connected in the background", drives [com.noop.ble.WhoopConnectionService]. Default on. */
     const val KEY_BACKGROUND_CONNECTION = "noop.backgroundConnection"
+
+    /** Boundary used by additive daily metrics. Sleep onset is the product default; midnight restores
+     * the conventional civil-day view. Naps never become boundaries. */
+    const val KEY_DAY_CYCLE_MODE = "noop.dayCycleMode"
+
+    fun dayCycleMode(context: Context): com.noop.analytics.DayCycleMode =
+        com.noop.analytics.DayCycleMode.fromPersisted(
+            of(context).getString(KEY_DAY_CYCLE_MODE, null),
+        )
+
+    fun setDayCycleMode(context: Context, mode: com.noop.analytics.DayCycleMode) {
+        of(context).edit().putString(KEY_DAY_CYCLE_MODE, mode.persistedValue).apply()
+    }
 
     /** "Continuous HRV capture", when on (AND background connection is on), NOOP holds the dense
      *  realtime HR stream armed even with no Live screen open, so the strap banks beat-to-beat R-R 24/7
@@ -399,9 +485,9 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_FAST_LINK_PHY, enabled).apply()
     }
 
-    /** #836, the raw-HR fingerprint ("count:maxTs") the last COMPLETED idle rescore scored against. The
-     *  15-min backstop tick skips when the current fingerprint equals this; cleared implicitly by any HR
-     *  insert/delete (the fingerprint moves). Mirrors the Swift `analyzeWatermark` UserDefaults key. */
+    /** #836, the complete raw-analysis fingerprint the last COMPLETED idle rescore scored against. The
+     *  15-min backstop tick skips when the current fingerprint equals this; any new scoring-stream row
+     *  moves it. Mirrors the Swift `analyzeWatermark` UserDefaults key. */
     fun analyzeWatermark(context: Context): String? =
         of(context).getString(KEY_ANALYZE_WATERMARK, null)
 
@@ -631,17 +717,53 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_APP_ICON_NAVY, navy).apply()
     }
 
-    /** Imperial/Metric display preference (D#103). Display-only, stored data stays SI. The length/mass
-     *  system is read by [UnitPrefs.system]; the temperature override (empty = "match the system") by
-     *  [UnitPrefs.temperature]. Mirrors macOS @AppStorage("units.system" / "units.temperature"). */
+    /** #1839: hide the overlay bottom bar while scrolling down, restore it on scrolling up. Default
+     *  ON (#1841). Only meaningful with the overlay layout, where the bar sits over content. */
+    const val KEY_BOTTOM_BAR_AUTO_HIDE = "noop.bottomBarAutoHide"
+
+    /** #1836 follow-up: the bar's glass alpha, as one of eight steps. See [com.noop.ui.alphaForOpacityStep]. */
+    const val KEY_BOTTOM_BAR_OPACITY_STEP = "noop.bottomBarOpacityStep"
+
+    /** #1836 follow-up: how much bigger the bar is drawn, one of [com.noop.ui.BOTTOM_BAR_SCALES]. */
+    const val KEY_BOTTOM_BAR_SCALE = "noop.bottomBarScale"
+
+    /** #1836: draw the bottom bar as an overlay (glass over the screen's backdrop) instead of a reserved
+     *  Scaffold slot. Default ON (#1841), after the overlay was confirmed on a device. */
+    const val KEY_OVERLAY_BOTTOM_BAR = "noop.overlayBottomBar"
+
+    /** #1821: Clock format ("system" / "twelveHour" / "twentyFourHour"). Shares its stored vocabulary
+     *  with the Apple @AppStorage binding via [com.noop.analytics.ClockFormatPreference]. */
+    const val KEY_CLOCK_FORMAT = com.noop.analytics.ClockFormatPreference.PREFS_KEY
+
+    /** Display-only unit preferences; stored data stays SI. `units.system` remains the body preference
+     *  for compatibility, while exercise distance can override it independently. */
     const val KEY_UNIT_SYSTEM = "units.system"
+    const val KEY_DISTANCE_UNIT_SYSTEM = "units.distance"
     const val KEY_TEMPERATURE_UNIT = "units.temperature"
+
+    /** #1846: which skin-temp number the cards lead with — "" / absent = a temperature (default), or the
+     *  DEVIATION raw to lead with the ±baseline move. Display-only; nothing stored ever changes. */
+    const val KEY_SKIN_TEMP_DISPLAY = "units.skinTempDisplay"
 
     fun setUnitSystem(context: Context, system: UnitSystem) {
         of(context).edit().putString(KEY_UNIT_SYSTEM, system.raw).apply()
     }
 
+    fun setDistanceUnitSystem(context: Context, system: UnitSystem) {
+        of(context).edit().putString(KEY_DISTANCE_UNIT_SYSTEM, system.raw).apply()
+    }
+
     /** Persist the temperature override, or pass null to clear it back to "match the system". */
+    fun setSkinTempDisplay(context: Context, kind: com.noop.analytics.SkinTempDisplay.Kind?) {
+        of(context).edit().apply {
+            if (kind == null || kind == com.noop.analytics.SkinTempDisplay.Kind.ABSOLUTE) {
+                remove(KEY_SKIN_TEMP_DISPLAY)
+            } else {
+                putString(KEY_SKIN_TEMP_DISPLAY, kind.raw)
+            }
+        }.apply()
+    }
+
     fun setTemperatureUnit(context: Context, unit: TemperatureUnit?) {
         of(context).edit().apply {
             if (unit == null) remove(KEY_TEMPERATURE_UNIT) else putString(KEY_TEMPERATURE_UNIT, unit.raw)
@@ -969,6 +1091,18 @@ object NoopPrefs {
         of(context).edit().putBoolean(KEY_COACH_SIGNALS, enabled).apply()
     }
 
+    /** K11: Coach multimodal chart image (opt-in, default OFF). When ON and the provider is Gemini,
+     *  a chart snapshot is sent as inline_data alongside the text. A THIRD opt-in on top of the
+     *  existing data consent. Only Gemini supports multimodal input. */
+    const val KEY_COACH_MULTIMODAL = "noop.coachMultimodal"
+
+    fun coachMultimodal(context: Context): Boolean =
+        of(context).getBoolean(KEY_COACH_MULTIMODAL, false)
+
+    fun setCoachMultimodal(context: Context, enabled: Boolean) {
+        of(context).edit().putBoolean(KEY_COACH_MULTIMODAL, enabled).apply()
+    }
+
     /** The user's EDITED Coach system prompt. Empty/absent means "use the built-in default". A small,
      *  non-secret text key, read FRESH per request so an edit takes effect on the next message. Mirrors
      *  macOS/iOS UserDefaults "ai.systemPrompt". */
@@ -1248,10 +1382,20 @@ object NoopPrefs {
      *  recreation / process restart and stops reverting to "Never". 0 = never synced on this install. */
     const val KEY_LAST_SYNC_AT = "noop.lastSyncAtSec"
 
+    /** LEGACY global reader. Kept only as [com.noop.ble.resolveLastSync]'s single-strap fallback, so an
+     *  install that has one strap keeps its timestamp across the upgrade. No longer written. */
     fun lastSyncAt(context: Context): Long = of(context).getLong(KEY_LAST_SYNC_AT, 0L)
 
-    fun setLastSyncAt(context: Context, epochSec: Long) {
-        of(context).edit().putLong(KEY_LAST_SYNC_AT, epochSec).apply()
+    /** This strap's own last completed offload, keyed by BLE address — see
+     *  [com.noop.ble.lastSyncPrefKey]. 0 when this strap has never synced. */
+    fun lastSyncAtFor(context: Context, peripheralId: String?): Long =
+        com.noop.ble.lastSyncPrefKey(peripheralId)?.let { of(context).getLong(it, 0L) } ?: 0L
+
+    /** Stamp a completed offload against the strap it came from. A blank address writes nothing rather
+     *  than writing to a key that belongs to no device. */
+    fun setLastSyncAtFor(context: Context, peripheralId: String?, epochSec: Long) {
+        val key = com.noop.ble.lastSyncPrefKey(peripheralId) ?: return
+        of(context).edit().putLong(key, epochSec).apply()
     }
 
     /** Last-known strap firmware string, persisted on connect so the debug export can name it OFFLINE
@@ -1263,6 +1407,31 @@ object NoopPrefs {
     fun setLastFirmware(context: Context, fw: String?) {
         of(context).edit().apply {
             if (fw.isNullOrBlank()) remove(KEY_LAST_FIRMWARE) else putString(KEY_LAST_FIRMWARE, fw)
+        }.apply()
+    }
+
+    /** This device's own persisted firmware, keyed by BLE address - see [com.noop.ble.firmwarePrefKey].
+     *  Null when nothing was ever recorded for that device. */
+    fun firmwareFor(context: Context, peripheralId: String?): String? =
+        com.noop.ble.firmwarePrefKey(peripheralId)?.let { of(context).getString(it, null) }
+
+    /** True when the 5/MG CLIENT_HELLO has been latched off for this device after the give-up (#1635).
+     *  Absent key == not suppressed, so an unknown device always gets its first attempt. */
+    fun helloSuppressed(context: Context, peripheralId: String?): Boolean =
+        com.noop.ble.helloSuppressionPrefKey(peripheralId)?.let { of(context).getBoolean(it, false) } ?: false
+
+    /** Latch or clear the hello suppression for one device. A blank address writes nothing. */
+    fun setHelloSuppressed(context: Context, peripheralId: String?, suppressed: Boolean) {
+        val key = com.noop.ble.helloSuppressionPrefKey(peripheralId) ?: return
+        of(context).edit().apply { if (suppressed) putBoolean(key, true) else remove(key) }.apply()
+    }
+
+    /** Record a firmware string against the device it came from. A blank address writes nothing rather
+     *  than writing to a key that belongs to no device. */
+    fun setFirmwareFor(context: Context, peripheralId: String?, fw: String?) {
+        val key = com.noop.ble.firmwarePrefKey(peripheralId) ?: return
+        of(context).edit().apply {
+            if (fw.isNullOrBlank()) remove(key) else putString(key, fw)
         }.apply()
     }
 }
@@ -1304,6 +1473,25 @@ fun NoopRoot() {
     // bell in the Today header surfaces it; the inbox row deep-links to the full changelog read.
     LaunchedEffect(onboarded) {
         if (onboarded) UpdateStore.from(context).seedWhatsNewIfNeeded()
+        // #1659: a sideloaded build has no store to update it, so the most NOOP can do is NOTICE a
+        // release and say so in the same inbox. On by default and switchable off in Settings — see
+        // UpdateAvailability.DEFAULT_ENABLED.
+        //
+        // Gated on onboarding AND terms, matching both Swift hooks: a default-on check must not reach the
+        // network during first run, nor while a returning user is looking at a re-prompted clickwrap —
+        // the Terms gate below sits AFTER this effect, so `onboarded` alone would not have held it back.
+        // Read from prefs rather than the `acceptedTerms` state, which is not declared until after this
+        // block.
+        //
+        // No re-entrancy guard here, unlike the Swift twin's `inFlight`: LaunchedEffect does not re-run on
+        // recomposition, only when its key changes, so this cannot fire twice for one launch. `.onAppear`
+        // gives no such promise, which is why the Swift side needs the flag. Moving this call anywhere
+        // that re-runs (a plain composable body, a keyless effect) would need the guard back.
+        val termsCurrent =
+            prefs.getString(NoopPrefs.KEY_ACCEPTED_TERMS_VERSION, "") == Terms.CURRENT_VERSION
+        if (onboarded && termsCurrent) {
+            com.noop.update.UpdateWatch.runIfDue(context, BuildConfig.VERSION_NAME)
+        }
     }
 
     // Terms acknowledgment gate, over EVERYTHING (before onboarding/pairing/Bluetooth) until the

@@ -135,7 +135,10 @@ private struct SyncStatusSection: View {
     @EnvironmentObject var model: AppModel
 
     /// The strap link is usable for a manual offload kick (matches BLEManager.syncNow's own gate).
-    private var canSync: Bool { live.connected && live.bonded && !live.backfilling }
+    ///
+    /// `historyReady`, not `bonded` alone: the live-HR path sets `bonded` for a 5/MG that has never
+    /// completed a handshake, so this enabled itself and beginBackfill then declined it silently.
+    private var canSync: Bool { live.connected && live.bonded && live.historyReady && !live.backfilling }
 
     var body: some View {
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
@@ -187,8 +190,10 @@ private struct SyncStatusSection: View {
                     .foregroundStyle(StrandPalette.textSecondary)
             }
         } else {
-            StatePill(live.bonded ? "Ready to sync" : "Pairing…",
-                      tone: .accent, showsDot: true, pulsing: !live.bonded)
+            // Same condition as the button below it. Keyed on `bonded` this said "Ready to sync" directly
+            // above a DISABLED Sync now, on exactly the strap that cannot sync.
+            StatePill(live.historyReady ? "Ready to sync" : "Pairing…",
+                      tone: .accent, showsDot: true, pulsing: !live.historyReady)
         }
     }
 
@@ -199,7 +204,11 @@ private struct SyncStatusSection: View {
         if !live.connected {
             return String(localized: "Connect your strap to sync its stored history. Until then, only imported data shows here.")
         }
-        if !live.bonded {
+        // historyReady, not `bonded`. This branch already said the right thing and simply never fired on
+        // the strap that needed it: `bonded` is set by the live-HR path, so a 5/MG that never completed a
+        // handshake fell through to the "syncs right away" line, under a Sync-now button that had just
+        // been disabled. Same condition as the button and the pill, so all three agree.
+        if !live.historyReady {
             return String(localized: "Finishing the pairing handshake. Sync now becomes available once the strap is paired.")
         }
         return String(localized: "Syncs your strap's stored history right away, instead of waiting for the next automatic sync.")
@@ -1227,6 +1236,7 @@ private struct VitalsSection: View {
     // Temperature display preference (D#103). Skin temp is stored in °C (absolute or a ±deviation); the
     // toggle re-labels it to °F. Display-only — banding still runs on the stored °C value.
     @AppStorage(UnitPrefs.systemKey) private var unitSystemRaw = UnitSystem.metric.rawValue
+    @AppStorage(UnitPrefs.skinTempDisplayKey) private var skinTempDisplayRaw = ""   // #1846
     @AppStorage(UnitPrefs.temperatureKey) private var temperatureRaw = ""
     private var temperatureUnit: TemperatureUnit {
         let system = UnitSystem(rawValue: unitSystemRaw) ?? .metric
@@ -1244,7 +1254,8 @@ private struct VitalsSection: View {
             sourceRows: repo.vitalMetricRows,
             temperatureUnit: temperatureUnit,
             spo2CandidateByDay: spo2CandidateByDay,
-            hrvOverCountByDay: hrvOverCountByDay
+            hrvOverCountByDay: hrvOverCountByDay,
+            skinTempPreferred: SkinTempDisplay.Kind(rawValue: skinTempDisplayRaw) ?? .absolute   // #1846
         )
         VStack(alignment: .leading, spacing: NoopMetrics.gap) {
             SectionHeader("Vital Signs", overline: "Latest", trailing: BodyVitalSigns.latestDayLabel(readings))

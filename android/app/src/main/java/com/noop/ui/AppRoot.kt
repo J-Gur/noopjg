@@ -1,5 +1,6 @@
 package com.noop.ui
 
+import android.content.Context
 import androidx.annotation.StringRes
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -97,6 +98,17 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.foundation.layout.calculateStartPadding
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
@@ -104,6 +116,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import com.noop.push.SelfHostedPushScreen
 
 // MARK: - Navigation model
 //
@@ -171,6 +184,8 @@ private enum class Destination(
     Notifications("notifications", R.string.nav_notifications, Icons.Filled.Notifications),
     PowerSaving("power_saving", R.string.nav_power_saving, Icons.Filled.BatteryStd),
     Settings("settings", R.string.nav_settings, Icons.Filled.Settings),
+    // Experimental and intentionally absent from More: reachable only through Settings > Advanced.
+    SelfHostedPush("self_hosted_push", R.string.nav_self_hosted_push, Icons.Filled.CloudSync),
     // Nested Settings destination shared by the Settings row and a blank WHOOP 4.0 Steps tile (#1515).
     // Deliberately absent from [drawerGroups]: it is contextual, not another top-level More item.
     StepsCalibration(
@@ -179,6 +194,7 @@ private enum class Destination(
         Icons.Filled.Tune,
     ),
     TestCentre("test_centre", R.string.nav_test_centre, Icons.Filled.BugReport),
+    GroundTruthCollector("ground_truth_collector", R.string.ground_truth_title, Icons.Filled.Sensors),
 
     // The "More" tab: its own navigated page (mirroring the iOS More tab) that hosts the full
     // grouped destination list. It is NOT itself in any [DrawerGroup] — it's the door to them.
@@ -266,6 +282,177 @@ internal object MoreSectionPrefs {
 }
 
 /**
+ * #1839: should the overlay bar be hidden right now?
+ *
+ * Pure so the decision is testable without Compose — the separation the #90 prototype got right.
+ *
+ * Gated on [overlay] deliberately. In the slot layout the Scaffold has RESERVED the bar's space, so
+ * translating the bar away would leave an empty band rather than handing the space back to content —
+ * visibly worse than not hiding at all. Auto-hide only makes sense over content.
+ */
+internal fun shouldHideBar(
+    autoHide: Boolean,
+    overlay: Boolean,
+    scrollingDown: Boolean,
+    pinned: Boolean = false,
+): Boolean = !pinned && autoHide && overlay && scrollingDown
+
+/**
+ * #1839: does this scroll delta change the direction, or is it noise?
+ *
+ * Returns true for "scrolling down into the page", false for up, and null when the movement is under
+ * [threshold] and should be ignored — without that, a fingertip tremor flickers the bar continuously.
+ * A NEGATIVE delta means content moved up, which is the user scrolling down.
+ */
+internal fun scrollDirectionChange(delta: Float, threshold: Float): Boolean? = when {
+    delta <= -threshold -> true
+    delta >= threshold -> false
+    else -> null
+}
+
+/**
+ * #1839: the 0..1 collapse fraction the bar's transform rides.
+ *
+ * Reduce Motion pins it to 0 — VISIBLE — rather than snapping between hidden and shown. A bar that
+ * teleports away without animation reads as a glitch, and someone who has asked for less motion is the
+ * last person who should get that. #90 snapped to 0/1 instead; keeping the bar put is the kinder reading.
+ */
+internal fun barCollapseFraction(hidden: Boolean, reduceMotion: Boolean): Float =
+    if (reduceMotion) 0f else if (hidden) 1f else 0f
+
+/**
+ * #1836: which bottom-bar layout to use, snapshot-backed so the Settings toggle applies without a
+ * relaunch (the same shape as `BackgroundImageStore.enabled`).
+ *
+ * Default ON as of #1841. It shipped switchable and default-off first so it could be tried without being
+ * imposed; the overlay was then confirmed on a device. The switch stays, so anyone who dislikes it — or
+ * hits a screen that misbehaves — can put the reserved-slot layout back.
+ *
+ * An explicit choice is preserved either way: `getBoolean(key, true)` returns a stored `false` for someone
+ * who turned it off, and only an install that never touched the setting picks up the new default.
+ */
+object BottomBarStyleStore {
+    /** True = the overlay bar (glass over the screen's own backdrop). False = the reserved slot. */
+    var overlay by mutableStateOf(true)
+        private set
+
+    /**
+     * The bar's MEASURED height, published so [ScreenScaffold] can clear it.
+     *
+     * This is the half that makes the overlay actually do something. Moving the bar out of the slot is not
+     * enough on its own: a screen's backdrop is painted INSIDE the screen, so while the screen is inset
+     * above the bar the backdrop stops there too and the glass has nothing behind it but the shell's
+     * container colour. The screen has to reach the bottom edge, with its scrolling CONTENT clearing the
+     * bar instead — which is what this height is for.
+     */
+    var barHeight by mutableStateOf(0.dp)
+        internal set
+
+    /**
+     * The inset a screen's CONTENT should add, which is the bar height only while the overlay is on.
+     * A single accessor so callers cannot forget the `overlay` half and inset content in the slot
+     * layout, where the Scaffold has already reserved that space.
+     */
+    fun barHeightForContent(): Dp = if (overlay) barHeight else 0.dp
+
+    /**
+     * How see-through the bar's glass is, in EIGHT steps: 1 the most transparent, 8 solid.
+     *
+     * A step rather than a raw float so the two ends are reachable and every stop is repeatable - a
+     * continuous slider on a bar this small mostly produces values a user cannot tell apart or return to.
+     * The mapping is linear from 0.30 to 1.00, which puts the SHIPPED 0.80 exactly on step 6, so an
+     * install that never touches this is byte-identical to before.
+     */
+    var opacityStep by mutableStateOf(DEFAULT_OPACITY_STEP)
+        private set
+
+    /** The alpha for [opacityStep]. Step 1 = 0.30 ... step 6 = 0.80 (the shipped value) ... step 8 = 1.00. */
+    val barAlpha: Float get() = alphaForOpacityStep(opacityStep)
+
+    /**
+     * How much bigger the bar is drawn, from 1x to 2x.
+     *
+     * Scales the bar's CONTENT - icon, label and the padding around them - rather than applying a
+     * graphics scale to the finished bar, which would blur it and leave the touch targets where they
+     * were. The bar's height is measured and republished either way ([barHeight]), so screens keep
+     * clearing it correctly at any size without a second number to maintain.
+     */
+    var scale by mutableStateOf(DEFAULT_SCALE)
+        private set
+
+    /**
+     * Hold the bar visible regardless of auto-hide, while something is adjusting how it LOOKS.
+     *
+     * The transparency slider sits below the fold in Settings, so reaching it means scrolling down -
+     * which is exactly what auto-hide reads as "hide the bar". The control's live preview was therefore
+     * invisible at the moment it mattered, and touching the slider does not scroll, so nothing brought
+     * the bar back. Pinning while the drag is in flight is the narrowest fix: auto-hide is untouched as
+     * a setting, and the pin lasts only as long as a finger is down.
+     */
+    var previewPinned by mutableStateOf(false)
+        private set
+
+    /** Named `pinPreview` rather than `setPreviewPinned`: the latter is the property's own generated
+     *  setter, and declaring both is a JVM signature clash. */
+    fun pinPreview(value: Boolean) {
+        previewPinned = value
+    }
+
+    /**
+     * Move the bar NOW without persisting, for a slider drag.
+     *
+     * Separate from [setOpacityStep] because a drag emits a value per frame: persisting each one would
+     * write SharedPreferences dozens of times to record a decision the user makes once, on release. The
+     * card-opacity slider already splits it this way; this is the same split, not a new idea.
+     */
+    fun previewOpacityStep(step: Int) {
+        opacityStep = step.coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+    }
+
+    /** Set and persist - for a committed choice, i.e. the end of a drag. */
+    fun setOpacityStep(ctx: Context, step: Int) {
+        val clamped = step.coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+        opacityStep = clamped
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putInt(NoopPrefs.KEY_BOTTOM_BAR_OPACITY_STEP, clamped).apply()
+    }
+
+    fun setScale(ctx: Context, value: Float) {
+        val clamped = nearestScale(value)
+        scale = clamped
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putFloat(NoopPrefs.KEY_BOTTOM_BAR_SCALE, clamped).apply()
+    }
+
+    /** #1839: hide the overlay bar while scrolling down, bring it back on scrolling up. Default ON. */
+    var autoHide by mutableStateOf(true)
+        private set
+
+    fun setAutoHide(ctx: Context, value: Boolean) {
+        autoHide = value
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, value).apply()
+    }
+
+    fun load(ctx: Context) {
+        val prefs = NoopPrefs.of(ctx.applicationContext)
+        overlay = prefs.getBoolean(NoopPrefs.KEY_OVERLAY_BOTTOM_BAR, true)
+        autoHide = prefs.getBoolean(NoopPrefs.KEY_BOTTOM_BAR_AUTO_HIDE, true)
+        // Both are read through the same clamps the setters use, so a hand-edited or downgraded pref
+        // cannot put the bar in a state the UI has no way to leave.
+        opacityStep = prefs.getInt(NoopPrefs.KEY_BOTTOM_BAR_OPACITY_STEP, DEFAULT_OPACITY_STEP)
+            .coerceIn(MIN_OPACITY_STEP, MAX_OPACITY_STEP)
+        scale = nearestScale(prefs.getFloat(NoopPrefs.KEY_BOTTOM_BAR_SCALE, DEFAULT_SCALE))
+    }
+
+    fun set(ctx: Context, value: Boolean) {
+        overlay = value
+        NoopPrefs.of(ctx.applicationContext).edit()
+            .putBoolean(NoopPrefs.KEY_OVERLAY_BOTTOM_BAR, value).apply()
+    }
+}
+
+/**
  * App shell: a single [Scaffold] with a floating [GlassBottomBar] (Today · Trends · Sleep · More)
  * driving one [NavHost], mirroring the iOS RootTabView. There is NO global toolbar and no nav drawer
  * — every screen self-titles via [ScreenScaffold], and the "More" sheet (opened from the bar) reaches
@@ -290,7 +477,54 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
     // survives the inbox sheet closing — the tap dismisses the inbox and presents this over the app.
     var showWhatsNewFromInbox by remember { mutableStateOf(false) }
 
-    run {
+    // #1836: an overlay container, not a bottomBar slot. The slot sat OUTSIDE the screen content, so a
+    // screen's own backdrop (LiquidScreenSky / BackgroundImageBackdrop) stopped where the bar began and
+    // the bar's 0.80 "glass" had nothing behind it but surfaceBase — a bar built to float rendered as a
+    // dark strip cut out of the background. As a sibling drawn OVER the Scaffold it sits on the screen's
+    // own sky, which is what the translucency was written for.
+    // #1836: the inset MEASURED, never assumed. The bar's height includes navigationBarsPadding(), which
+    // differs by roughly 24dp between gesture navigation and 3-button navigation, and changes on rotation
+    // and on a foldable unfolding. The Scaffold slot used to measure it for us; a constant here would put
+    // content behind the bar on exactly the devices the report came from. One extra layout pass at
+    // startup, then stable.
+    var barHeightPx by remember { mutableIntStateOf(0) }
+    val density = LocalDensity.current
+    val barHeight = with(density) { barHeightPx.toDp() }
+    // #1839: auto-hide. ONE NestedScrollConnection on the shell means every screen gets the behaviour with
+    // no per-screen wiring — scrollable children dispatch their deltas up to it. onPreScroll only flips a
+    // Boolean, and only on a movement past the threshold, so a fingertip tremor cannot flicker the bar.
+    var scrollingDown by remember { mutableStateOf(false) }
+    val reduceMotion = rememberReduceMotion()
+    val hidden = shouldHideBar(BottomBarStyleStore.autoHide, BottomBarStyleStore.overlay, scrollingDown,
+                               pinned = BottomBarStyleStore.previewPinned)
+    val collapseTarget = barCollapseFraction(hidden, reduceMotion)
+    // The transform is a graphicsLayer only — GPU, per frame, NO relayout — so content never reflows as
+    // the bar comes and goes and scrolling stays smooth. (The approach #90 got right.)
+    // Held as the State, not unwrapped with `by`, ON PURPOSE. Reading a `Float` in composition would
+    // recompose this whole shell — Scaffold and NavHost included — on EVERY animation frame, which is the
+    // exact jank the graphicsLayer-only approach exists to avoid. Instead:
+    //   - the transform reads `.value` INSIDE graphicsLayer, a deferred read that updates the layer with
+    //     no recomposition at all;
+    //   - presence is a derivedStateOf, so composition is invalidated once when the bar appears or
+    //     disappears, not sixty times a second while it moves.
+    val collapseState = animateFloatAsState(
+        targetValue = collapseTarget,
+        animationSpec = tween(durationMillis = 220),
+    )
+    val barPresent by remember { derivedStateOf { collapseState.value < 1f } }
+    // Landing on a new screen with no visible way to navigate is disorienting, and the bar cannot be
+    // tapped to fix it because it is the thing that is hidden. Reset on every route change so a screen
+    // always opens with its navigation present; scrolling down again hides it as before.
+    LaunchedEffect(currentRoute) { scrollingDown = false }
+    val autoHideScroll = remember {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                scrollDirectionChange(available.y, threshold = 3f)?.let { scrollingDown = it }
+                return Offset.Zero
+            }
+        }
+    }
+    Box(Modifier.fillMaxSize().nestedScroll(autoHideScroll)) {
         Scaffold(
             containerColor = Palette.surfaceBase,
             bottomBar = {
@@ -299,18 +533,42 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 // top-right (balancing the avatar), so the bar is clean tabs only. "More" navigates to
                 // its own page (mirroring the iOS More tab) that reaches every grouped destination, so no
                 // destination is lost without the drawer.
-                GlassBottomBar(
-                    current = current,
-                    onTabSelected = { dest ->
-                        if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
-                    },
-                )
+                // DEFAULT path: the shipped reserved slot, unchanged. Empty only when the overlay is
+                // on, where the bar is drawn below as a sibling and the slot must reserve nothing.
+                if (!BottomBarStyleStore.overlay) {
+                    GlassBottomBar(
+                        current = current,
+                        onTabSelected = { dest ->
+                            if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
+                        },
+                    )
+                }
             },
         ) { inner ->
             NavHost(
                 navController = nav,
                 startDestination = Destination.Today.route,
-                modifier = Modifier.padding(inner),
+                // The empty slot reserves nothing, so the bar's height is added here — the one place the
+                // inset used to come from. A scrollable that later wants content to pass UNDER the glass
+                // adds this measured height to its own contentPadding instead; no shared modifier can.
+                // Slot layout: the Scaffold measured the bar into `inner`, so use it as-is.
+                // Overlay layout: the slot reserves nothing, so the bottom comes from the measured bar.
+                modifier = if (!BottomBarStyleStore.overlay) Modifier.padding(inner) else Modifier.padding(
+                    // Take the top and sides from the Scaffold, but REPLACE its bottom rather than adding
+                    // to it. Scaffold's default contentWindowInsets is WindowInsets.systemBars, so
+                    // `inner.bottom` already carries the navigation-bar inset — and the bar's measured
+                    // height carries it too, via its own navigationBarsPadding(). Adding both counted that
+                    // inset twice and left roughly a nav-bar's worth of dead space above the bar, widest
+                    // on 3-button navigation. The bar owns that inset; content just clears the bar.
+                    top = inner.calculateTopPadding(),
+                    start = inner.calculateStartPadding(LocalLayoutDirection.current),
+                    end = inner.calculateEndPadding(LocalLayoutDirection.current),
+                    // Bottom is ZERO on purpose: the screen must reach the bottom edge so its own backdrop
+                    // paints behind the glass. ScreenScaffold clears the bar from the scrolling CONTENT
+                    // instead, using BottomBarStyleStore.barHeight. Insetting here is what made the first
+                    // version of this change invisible — the bar moved, the backdrop did not follow.
+                    bottom = 0.dp,
+                ),
                 // README motion: top-level destinations crossfade (~240ms) on the calm,
                 // decelerating global easing — nothing slides or bounces between tabs. The
                 // same fade is used for back (pop) so the bar never feels jerky. Drill-ins
@@ -351,6 +609,9 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                         onOpenSleep = { nav.navigateTopLevel(Destination.Sleep.route) },
                         // Optional Coupled view card (task #43): a normal push so back returns to Today.
                         onOpenCoupled = { nav.navigate(Destination.CoupledView.route) },
+                        // #1862: the Coach launcher hands off here. Without this the sheet's buttons
+                        // would fall back to the parameter's no-op default and silently do nothing.
+                        onOpenCoach = { nav.navigateTopLevel(Destination.Coach.route) },
                         // The "workout in progress" indicator: raise the one-shot the Live screen consumes to
                         // re-open the in-exercise overlay, then route to Live. One tap from Today (iOS parity).
                         onOpenActiveWorkout = {
@@ -452,6 +713,7 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                         viewModel,
                         onOpenTestCentre = { nav.navigate(Destination.TestCentre.route) },
                         onOpenBackupSync = { nav.navigate(Destination.BackupSync.route) },
+                        onOpenSelfHostedPush = { nav.navigate(Destination.SelfHostedPush.route) },
                         onOpenStepsCalibration = { nav.navigate(Destination.StepsCalibration.route) },
                     )
                 }
@@ -468,7 +730,13 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                         onClose = { nav.popBackStack() },
                     )
                 }
-                composable(Destination.TestCentre.route) { TestCentreScreen(viewModel) }
+                composable(Destination.SelfHostedPush.route) { SelfHostedPushScreen() }
+                composable(Destination.TestCentre.route) {
+                    TestCentreScreen(viewModel, onOpenGroundTruthCollector = {
+                        nav.navigate(Destination.GroundTruthCollector.route)
+                    })
+                }
+                composable(Destination.GroundTruthCollector.route) { GroundTruthCollectorScreen(viewModel) }
                 // The "More" page — the iOS More tab's twin: a navigated ScreenScaffold page hosting the
                 // full grouped destination list (was a pull-up sheet). A row pushes its destination so
                 // Android Back returns to More instead of skipping straight to Today.
@@ -603,6 +871,32 @@ fun AppRoot(viewModel: AppViewModel = viewModel()) {
                 }
             }
         }
+
+        // Drawn OVER the Scaffold, so it floats on whatever backdrop the current screen painted rather
+        // than on the shell's own container colour. Same composable, same insets — only its parent moved.
+        // `collapse < 1f` and not just `overlay`: at alpha 0 the bar is invisible but still COMPOSED, so
+        // TalkBack could focus a bar nobody can see and a tap could land on a control that is not there.
+        // Dropping it at the end of the animation removes both. Safe precisely because it is an overlay —
+        // it reserves no space, so composing or not composing it never reflows content.
+        if (BottomBarStyleStore.overlay && barPresent) GlassBottomBar(
+            current = current,
+            onTabSelected = { dest ->
+                if (dest.route != currentRoute) nav.navigateTopLevel(dest.route)
+            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .graphicsLayer {
+                    // Slide it out past its own height so the whole capsule clears the edge, and fade so
+                    // it does not read as a bar stuck half off-screen mid-animation.
+                    val c = collapseState.value      // deferred read: layer only, no recomposition
+                    translationY = c * (barHeightPx.toFloat())
+                    alpha = 1f - c
+                }
+                .onSizeChanged {
+                    barHeightPx = it.height
+                    BottomBarStyleStore.barHeight = with(density) { it.height.toDp() }
+                },
+        )
     }
 }
 
@@ -766,10 +1060,11 @@ private val barTrailingTabs = listOf(
 private fun GlassBottomBar(
     current: Destination,
     onTabSelected: (Destination) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val barShape = RoundedCornerShape(50)
     Box(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             // Clear the gesture-nav bar (home indicator) first, then add breathing room so the capsule
             // floats free of the bottom edge rather than jamming against it — iOS clears the home-indicator
@@ -784,7 +1079,9 @@ private fun GlassBottomBar(
             // "Glass": a translucent raised surface — a frosted island, not a hard slab. Compose has no
             // cheap blur, so translucency (≈0.80) + a hairline rim is the Liquid-Glass stand-in. A soft,
             // low drop shadow reads as floating without a glow.
-            color = Palette.surfaceRaised.copy(alpha = 0.80f),
+            // The glass alpha is the user's transparency step; 0.80 was the shipped constant and remains
+            // the default (step 6), so an untouched install is unchanged.
+            color = Palette.surfaceRaised.copy(alpha = BottomBarStyleStore.barAlpha),
             tonalElevation = 2.dp,
             shadowElevation = 4.dp,
             modifier = Modifier
@@ -796,7 +1093,11 @@ private fun GlassBottomBar(
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 8.dp, vertical = 7.dp),
+                    // Scaling the PADDING and the slot contents grows the bar honestly - the touch
+                    // targets grow with it, and `barHeight` is measured afterwards so screens keep
+                    // clearing the bar at any size. A graphics scale would blur it and leave the hit
+                    // areas behind.
+                    .padding(horizontal = 8.dp, vertical = 7.dp * BottomBarStyleStore.scale),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
             ) {
@@ -853,16 +1154,19 @@ private fun BarSlot(
                 indication = null,
                 onClick = onClick,
             )
-            .padding(vertical = 3.dp)
+            .padding(vertical = 3.dp * BottomBarStyleStore.scale)
             .semantics { contentDescription = label },
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(3.dp),
     ) {
-        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(Metrics.iconSmall))
+        // Icon and label scale together with the padding above, so the slot grows as one piece rather
+        // than a bigger box around the same small glyph.
+        Icon(icon, contentDescription = null, tint = tint,
+             modifier = Modifier.size(Metrics.iconSmall * BottomBarStyleStore.scale))
         Text(
             label,
             style = NoopType.footnote.copy(
-                fontSize = 10.sp,
+                fontSize = 10.sp * BottomBarStyleStore.scale,
                 fontWeight = if (active) FontWeight.SemiBold else FontWeight.Medium,
             ),
             color = tint,

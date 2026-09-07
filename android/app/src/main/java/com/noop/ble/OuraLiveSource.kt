@@ -52,6 +52,32 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * The label a discovered ring is listed under: its advertised local name, or [fallback] when it did not
+ * advertise one.
+ *
+ * A BONDED ring routinely stops advertising a local name, so the blank case is the NORMAL case for the
+ * ring a user most wants to reconnect to (#1776), not an error path - the scan's ScanFilter is the only
+ * gate and the name is a label. Callers therefore never see a blank `DiscoveredRing.name`, which is why
+ * the wizard renders it unguarded on both platforms (#1783 reads that as a missing guard; the guard is
+ * here, at the single construction site).
+ *
+ * BLANK, not empty. `isBlank` treats an all-whitespace name as absent; the Swift twin
+ * `ouraAdvertisedLabel` in `Strand/BLE/OuraLiveSource.swift` used `isEmpty`, which does not, so a ring
+ * advertising `" "` listed as "Oura" here and blank there - the exact silent Kotlin/Swift divergence the
+ * parity contract calls out. Both sides now treat whitespace as absent and return the name UNTRIMMED
+ * when it is present, and `OuraNamelessRingDiscoveryTest` pins this function against the Swift twin's
+ * own output. The two agree over ASCII whitespace, ordinary names, and U+00A0. `ifBlank` does NOT test
+ * `Character.isWhitespace`, which would indeed exclude U+00A0; it tests Kotlin's `Char.isWhitespace`,
+ * defined as `Character.isWhitespace(c) || Character.isSpaceChar(c)`, and the second disjunct restores
+ * every non-breaking space the first drops. The pair parts only on U+0085 (blank on Apple, not here)
+ * and U+001C-U+001F (blank here, not on Apple), which no BLE local name carries - stated rather than
+ * silently overclaimed.
+ */
+internal fun ouraAdvertisedLabel(advertisedName: String, fallback: String): String =
+    advertisedName.ifBlank { fallback }
+
+
+/**
  * EXPERIMENTAL, ISOLATED live-BLE source for the Oura ring (gen3 / gen4 / gen5).
  *
  * Faithful Kotlin twin of Strand/BLE/OuraLiveSource.swift. This replaced an earlier honest dead-end
@@ -285,6 +311,14 @@ class OuraLiveSource(
     private var loggedFirstTemp = false
     /** Logs the FIRST SpO2 sample decoded this session only. Twin of [loggedFirstTemp]. */
     private var loggedFirstSpo2 = false
+    /** The 0x13 SyncTime reply parked because nothing yet available could disambiguate its unit (ticks vs
+     *  seconds x10): the resume cursor was 0 (fresh pair / post-reboot full pull) or so stale the ring's
+     *  clock had run past the window. Retried against the drain's maxSeenRingTime as the first batch lands
+     *  (2026-09-02/03 captures). The ORIGINAL receipt wall-clock is carried along, because THAT is the instant the ring's
+     *  counter pairs with - re-stamping at retry time would skew the anchor by the drain's latency.
+     *  Twin of Swift's pendingSyncTime. */
+    private var pendingSyncTime: Triple<Long, Int, Long>? = null
+
     /** Logs the FIRST ring-time -> UTC anchor of this session only (s5.5); reset on stop/disconnect. */
     private var loggedAnchor = false
     /** Tier-B (UNVERIFIED) kinds ("activity" / "real_steps" / "sleep_summary" / "spo2_smoothed") already
@@ -809,27 +843,71 @@ class OuraLiveSource(
     }
 
     /**
+     * The ring-time floor the 0x13 unit test disambiguates against: the persisted resume cursor, or the
+     * largest envelope ring-time this drain has seen when that is further along. maxSeenRingTime is the
+     * half that breaks the deadlock (2026-09-02/03 captures) — it counts EVERY history record, anchored or not, so it is
+     * readable with no anchor, whereas the cursor can only advance once an anchor exists.
+     * Twin of Swift's syncTimeAnchorLowerBound.
+     */
+    private val syncTimeAnchorLowerBound: Long
+        get() = maxOf(historyCursor, drain.maxSeenRingTime)
+
+    /**
+     * Try to turn a 0x13 SyncTime reply into this session's UTC anchor, returning whether it stuck.
+     * [receivedAt] is the host wall-clock at the moment the reply ARRIVED (not now), since that is the
+     * instant the ring's counter pairs with. Shared by the at-connect attempt and the retry.
+     * Twin of Swift's adoptSyncTimeAnchor.
+     */
+    private fun adoptSyncTimeAnchor(
+        d: OuraDriver,
+        deviceTimestamp: Long,
+        status: Int,
+        receivedAt: Long,
+        source: String,
+    ): Boolean {
+        val rt = OuraDriver.syncTimeAnchorCandidate(deviceTimestamp, syncTimeAnchorLowerBound)
+            ?: return false
+        if (!d.adoptSyncTimeAnchor(ringTimestamp = rt, unixSeconds = receivedAt)) return false
+        val unit = if (rt == deviceTimestamp) "ticks" else "seconds x10"
+        val raw = "0x%08x".format(deviceTimestamp)
+        if (!loggedAnchor) {
+            loggedAnchor = true
+            log("Oura: UTC anchor from SyncTime response (0x13) $source - device rt $rt [$unit, " +
+                "raw $raw, status $status] = its receipt time; no 0x42 needed this session")
+        }
+        drainPendingAnchorEvents()
+        drainPendingHypnogramBursts()
+        return true
+    }
+
+    /**
      * Anchor from the 0x13 SyncTime response (ringverse: the ring's clock counter when it processed
-     * our SyncTime, paired with host wall-clock at receipt). The tick unit is disambiguated against
-     * the persisted resume cursor; no unambiguous reading → log the raw value and adopt NOTHING (an
-     * honest missing anchor beats a guessed one). Kotlin twin of Swift's handleSyncTimeResponse.
+     * our SyncTime, paired with host wall-clock at receipt). The tick unit is disambiguated against a
+     * known-earlier ring-time. At connect the only reference is the resume cursor, which is 0 on a fresh
+     * pair and may be far staler than the ring's clock; rather than discard the reply, PARK it and retry
+     * once history starts landing (2026-09-02/03 captures). Still adopts NOTHING on ambiguity — an honest missing anchor
+     * beats a guessed one. Kotlin twin of Swift's handleSyncTimeResponse.
      */
     private fun handleSyncTimeResponse(d: OuraDriver, resp: com.noop.oura.SyncTimeResponse) {
         val now = System.currentTimeMillis() / 1000L
+        if (adoptSyncTimeAnchor(d, resp.deviceTimestamp, resp.status, now, "at connect")) return
+        pendingSyncTime = Triple(resp.deviceTimestamp, resp.status, now)
         val raw = "0x%08x".format(resp.deviceTimestamp)
-        val rt = OuraDriver.syncTimeAnchorCandidate(resp.deviceTimestamp, historyCursor)
-        if (rt != null && d.adoptSyncTimeAnchor(ringTimestamp = rt, unixSeconds = now)) {
-            val unit = if (rt == resp.deviceTimestamp) "ticks" else "seconds x10"
-            if (!loggedAnchor) {
-                loggedAnchor = true
-                log("Oura: UTC anchor from SyncTime response (0x13) - device rt $rt [$unit, raw $raw, " +
-                    "status ${resp.status}] = now; no 0x42 needed this session")
-            }
-            drainPendingAnchorEvents()
-            drainPendingHypnogramBursts()
-        } else {
-            log("Oura: SyncTime response (0x13) raw $raw status ${resp.status} - no unambiguous tick " +
-                "reading vs cursor $historyCursor; anchor NOT adopted (investigation)")
+        log("Oura: SyncTime response (0x13) raw $raw status ${resp.status} - no unambiguous tick " +
+            "reading vs ring-time floor $syncTimeAnchorLowerBound; parked, retrying as history lands " +
+            "(investigation)")
+    }
+
+    /**
+     * Retry a parked 0x13 reply now that the drain has seen real ring-times. Silent on failure (the
+     * parked reply simply waits for a better floor); one line on success, from [adoptSyncTimeAnchor].
+     * Twin of Swift's retryPendingSyncTimeAnchor.
+     */
+    private fun retryPendingSyncTimeAnchor(d: OuraDriver) {
+        val parked = pendingSyncTime ?: return
+        if (drain.maxSeenRingTime <= 0) return
+        if (adoptSyncTimeAnchor(d, parked.first, parked.second, parked.third, "resolved against history")) {
+            pendingSyncTime = null
         }
     }
 
@@ -870,8 +948,9 @@ class OuraLiveSource(
             log("Oura: Bluetooth adapter is off - cannot scan")
             return
         }
-        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals; the
-        // callback further confirms the advertised name reads as an Oura ring.
+        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals. This
+        // ScanFilter is the ONLY discovery gate — the callback does not re-filter on the advertised name,
+        // because a bonded ring often advertises none; see the note in `scanCallback`.
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
@@ -927,6 +1006,7 @@ class OuraLiveSource(
         loggedFirstTemp = false
         loggedFirstSpo2 = false
         loggedAnchor = false
+        pendingSyncTime = null
         loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -1019,6 +1099,7 @@ class OuraLiveSource(
         loggedFirstTemp = false
         loggedFirstSpo2 = false
         loggedAnchor = false
+        pendingSyncTime = null
         loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -1099,16 +1180,21 @@ class OuraLiveSource(
             val device = result.device ?: return
             val address = device.address ?: return
             val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull() ?: ""
-            // Confirm the advertised name reads as an Oura ring (the service filter is the primary gate;
-            // this rejects anything that slipped through advertising the same base service).
-            if (ExperimentalBrand.recognise(name) != ExperimentalBrand.OURA) return
             val firstSight = seen.put(address, device) == null   // null → not seen before this scan
-            if (firstSight) log("Oura: found $name ($address) rssi ${result.rssi}")
-            // Best-effort generation guess from the advertised name (confirmed by the model the user picks).
+            if (firstSight) log("Oura: found ${ouraAdvertisedLabel(name, "Oura ring")} ($address) rssi ${result.rssi}")
+            // Best-effort generation guess from the advertised name — a LABEL only (the wizard falls back
+            // to GEN3 when it is null). Nothing is dropped here: startScan's ScanFilter pins SERVICE_UUID in
+            // the BT stack, so that is the gate, and a ring is listed even when it advertises no local name
+            // at all. This callback USED TO drop a nameless device (`ExperimentalBrand.recognise(name) !=
+            // OURA`, and `recognise("")` is null because no brand token is a substring of ""), so a BONDED
+            // ring — which often stops advertising a local name, and whose Android `device.name` bond-cache
+            // fallback is empty when the bond lives elsewhere — was the one ring the wizard could not show.
+            // Twin of the Apple side (Strand/BLE/OuraLiveSource.swift), which has always listed on the
+            // service filter alone. Do not re-add a name-based drop here.
             val detectedGen = OuraRingGen.recognise(name)
             val ring = DiscoveredRing(
                 address = address,
-                name = name.ifBlank { "Oura" },
+                name = ouraAdvertisedLabel(name, "Oura"),
                 rssi = result.rssi,
                 detectedGen = detectedGen,
             )
@@ -1159,6 +1245,7 @@ class OuraLiveSource(
                     loggedFirstTemp = false
                     loggedFirstSpo2 = false
                     loggedAnchor = false
+                    pendingSyncTime = null
                     loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -1542,6 +1629,10 @@ class OuraLiveSource(
                 for (e in events) {
                     e.envelopeRingTimestamp?.let { drain.noteSeenRingTime(it) }
                 }
+                // The drain now has a ring-time reference that needs no anchor, so a 0x13 reply parked at
+                // connect may be resolvable. Retry BEFORE emit, so this batch anchors straight away
+                // instead of parking into pendingAnchorEvents and being drained a moment later (2026-09-02/03 captures).
+                retryPendingSyncTimeAnchor(d)
                 if (pendingContinuation && events.isNotEmpty()) {
                     handler.removeCallbacks(batchQuietRunnable)
                     handler.postDelayed(batchQuietRunnable, batchQuietMs)
@@ -1809,8 +1900,10 @@ class OuraLiveSource(
                     // Other Tier-B tags (real_steps / activity-summary / sleep-summary / smoothed-SpO2,
                     // OURA_PROTOCOL.md s7.3; PR #960): logged ONCE PER KIND with the raw bytes so we can
                     // see whether the ring sends these tags at all and collect capture material - e.g.
-                    // real_steps 0x7E/0x7F is server-flag-gated OFF by default ([open_oura-feat]), so its
-                    // continued absence here is the ring's doing, not a decode gap.
+                    // real_steps 0x7E/0x7F was assumed server-flag-gated OFF ([open_oura-feat]), which
+                    // made its absence self-explanatory. That no longer holds: the ring's own status read
+                    // came back ENABLED on-device (#1629), so gating does NOT explain why these tags never
+                    // arrive, and whether that is the ring's doing or a decode gap is currently unknown.
                     if (loggedTierBKinds.add(e.value.kind)) {
                         val hex = e.value.rawPayload.joinToString(" ") { "%02x".format(it) }
                         log("Oura: Tier-B ${e.value.kind} seen (tag 0x${e.value.tag.toString(16)}) - raw: $hex")

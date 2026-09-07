@@ -157,13 +157,12 @@ private fun MetricGrid(m: SleepModel, onMetricClick: (String) -> Unit = {}) {
     }
 }
 
-// MARK: - 2b. Sleep-debt ledger (rolling 14-night running balance)
+// MARK: - 2b. Sleep-debt ledger (actionable next-night target)
 
 /**
- * A running balance of (slept − personal need) across the recent fortnight, surfaced as one
- * card: the net debt/surplus headline, a plain-English read, and a diverging bar of each
- * night's delta (surplus above the centre line, deficit below). Honest: a simple accumulator
- * — a surplus night offsets a deficit one — capped at 14 nights, no-data nights skipped.
+ * A recency-weighted estimate of unmet current need, surfaced with the raw per-night deltas.
+ * Meeting base need plus displayed debt clears it; extra sleep does not create a positive bank.
+ * History stays capped at 14 counted nights and no-data nights remain skipped.
  * Mirrors the macOS SleepDebtLedgerCard section-for-section. `internal` and keyed on the shared
  * [SleepModel] so the Today host (TodayScreen) can render the SAME view the Sleep tab does (a mirror,
  * not a copy); the nap-credited ledger is read from `m.sleepDebtLedger`, never recomputed here. Twin of
@@ -173,7 +172,7 @@ private fun MetricGrid(m: SleepModel, onMetricClick: (String) -> Unit = {}) {
 internal fun SleepDebtLedgerHostCard(m: SleepModel) {
     val ledger = m.sleepDebtLedger
     Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
-        SectionHeader("Sleep-debt ledger", overline = "Last 14 nights", trailing = "running balance")
+        SectionHeader("Sleep-debt ledger", overline = "Last 14 nights", trailing = "tonight's target")
         NoopCard(padding = Metrics.cardPadding, tint = Palette.restColor) {
             if (ledger.nightCount == 0) {
                 Text(
@@ -183,7 +182,7 @@ internal fun SleepDebtLedgerHostCard(m: SleepModel) {
                 )
             } else {
                 Column(verticalArrangement = Arrangement.spacedBy(Metrics.space14)) {
-                    // Headline: net balance + the short tag (sleep debt / surplus / balanced).
+                    // Headline: current debt or balanced.
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             debtHeadline(ledger),
@@ -499,6 +498,8 @@ internal fun AsleepDurationHostCard(hours: List<Double>, dates: List<String>) {
                         color = Palette.restColor,
                         selectionEnabled = true,
                         selectionLabels = dates.map(::shortDayLabel),
+                        // #1662: hours with one decimal and the unit, matching the Avg/Min/Max row above.
+                        formatValue = { String.format(Locale.US, "%.1f h", it) },
                     )
                     DateAxisRow(dates)
                 }
@@ -545,6 +546,8 @@ internal fun DurationTrend(m: SleepModel) {
                         // #691: on tap, show the DATE alongside the value (the shared chart's tooltip),
                         // matching the other trend graphs. trendDates is index-aligned with the values.
                         selectionLabels = m.trendDates.map(::shortDayLabel),
+                        // #1662: same hours format as the Avg/Min/Max row above.
+                        formatValue = { String.format(Locale.US, "%.1f h", it) },
                     )
                     DateAxisRow(m.trendDates)
                 }
@@ -579,6 +582,10 @@ internal fun DurationTrend(m: SleepModel) {
                         color = Palette.metricRose,
                         selectionEnabled = true,
                         selectionLabels = m.trendDates.map(::shortDayLabel),   // #691: hover shows date + value
+                        // #1662: debt is shown as a DURATION ("7h 20m") in the card's trailing value and
+                        // its Avg/Max row, so a bare "7.3" on tap was a different unit, not just a
+                        // different precision.
+                        formatValue = { durationText(it * 60.0) },
                     )
                     DateAxisRow(m.trendDates)
                 }
@@ -1122,4 +1129,3 @@ internal fun SleepConsistencyCard(
         }
     }
 }
-
