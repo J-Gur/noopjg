@@ -32,6 +32,7 @@ import com.noop.data.EventEntry
 import com.noop.data.StandardHrMapping
 import com.noop.data.StreamBatch
 import com.noop.data.StreamPersistence
+import com.noop.protocol.RawImuSample
 import com.noop.protocol.Whoop5RawImu
 import com.noop.testcentre.ImuSessionFileStore
 import com.noop.data.WhoopRepository
@@ -2418,11 +2419,21 @@ class WhoopBleClient(
     /** (Re)apply the GATT connection priority for the current link state (#477). Idempotent + cheap: OFF
      *  or disconnected -> no BLE op. Called on connect-established and whenever offload / live-HR toggles. */
     private fun refreshConnectionPriority() {
-        val rawCaptureHigh = connectedFamily == DeviceFamily.WHOOP5 && rawCaptureHighPriority(
-            captureActive = groundTruthImuSessionId != null,
-            backfilling = backfilling,
-            needsRepair = ImuSessionFileStore(context).needsHighThroughput(deviceId),
-        )
+        val rawCaptureHigh = when (connectedFamily) {
+            DeviceFamily.WHOOP5 -> rawCaptureHighPriority(
+                captureActive = groundTruthImuSessionId != null,
+                backfilling = backfilling,
+                needsRepair = ImuSessionFileStore(context).needsHighThroughput(deviceId),
+            )
+            // Same reasoning as the 5/MG Ground Truth Collector above: the workout-window capture is
+            // the same order-of-magnitude BLE-airtime cost (~2 x 1.9 KB/s), so it gets the same
+            // high-throughput lease. No history-repair concept here (in-memory only, nothing to repair).
+            DeviceFamily.WHOOP4 -> rawCaptureHighPriority(
+                captureActive = workoutImuCaptureActive,
+                backfilling = backfilling,
+                needsRepair = false,
+            )
+        }
         // Preserve the zero-op default path, but release a completed capture's HIGH lease once.
         if (!connectionPriorityEnabled && !rawCaptureHigh && !rawCapturePriorityApplied) return
         val ops = gattOps ?: return
@@ -2565,6 +2576,94 @@ class WhoopBleClient(
             groundTruthImuCommandAllowed = false
         }
         log("Raw IMU fail-safe: unexpected realtime packet type $type while capture was off; stop requested")
+    }
+
+    // --- WHOOP4 workout-window raw IMU capture (Tier 1 step-count estimate, Experimental, opt-in) ---
+    //
+    // A WHOOP 4.0 has no hardware step counter at all (see StepsCounter.kt's own doc on the 5/MG-only
+    // @57 counter). This is a much lighter, purpose-built cousin of the WHOOP5 Ground Truth Collector
+    // above: no session ids, no file-backed segments, no history-repair — just an in-memory buffer for
+    // the duration of ONE tracked workout, cleared the moment it's read. Never touches disk; the
+    // computed estimate never writes to WorkoutRow.steps (see AppViewModel.workoutStepsFromImu).
+    //
+    // UNVERIFIED ON HARDWARE: every confirmed fact in docs/BLE_REVERSE_ENGINEERING.md §4 is about
+    // STOPPING SEND_R10_R11_REALTIME ([0x00]) — there is no on-device confirmation that [0x01] (or any
+    // payload) actually RESUMES the flood once stopped. [startWorkoutImuCapture] sends the best-guess
+    // resume payload and returns whether the command was accepted for SEND, never whether the flood
+    // actually resumed — exactly the same "an accepted command is not evidence samples arrived" caveat
+    // the Ground Truth Collector documents for its own bounded sequence. If resuming silently doesn't
+    // work, zero frames arrive and [takeWorkoutImuCapture] returns null: a fail-safe, not a crash or a
+    // fabricated count.
+    @Volatile private var workoutImuCaptureActive = false
+    private val workoutImuSamples = ArrayList<RawImuSample>()
+    private var workoutImuCaptureStartMs = 0L
+
+    /** Ceiling on accumulated samples (~90 min at 100 Hz) so a capture that never actually stops (a
+     *  missed/ineffective stop command, or an unexpectedly long workout) cannot grow this in-memory
+     *  list without bound. A real tracked workout should never approach this. */
+    private val maxWorkoutImuSamples = 100 * 60 * 90
+
+    /** Best-effort: resume the WHOOP 4.0's live raw-IMU flood for a tracked workout's duration. WHOOP4
+     *  only — returns false immediately for any other connected family (there is no equivalent live
+     *  path for 5/MG here; its own raw IMU is the separate, already-gated Ground Truth Collector
+     *  above). Safe to call repeatedly; each call resets the in-memory buffer. */
+    @Synchronized
+    fun startWorkoutImuCapture(): Boolean {
+        if (gatt == null || cmdCharacteristic == null) {
+            log("Workout IMU capture: band not connected / command channel not ready")
+            return false
+        }
+        if (connectedFamily != DeviceFamily.WHOOP4) {
+            log("Workout IMU capture: unsupported for connected family $connectedFamily")
+            return false
+        }
+        workoutImuSamples.clear()
+        workoutImuCaptureStartMs = System.currentTimeMillis()
+        workoutImuCaptureActive = true
+        refreshConnectionPriority()
+        // UNVERIFIED resume payload — see the file-level note above. [0x00] is the confirmed stop.
+        send(CommandNumber.SEND_R10_R11_REALTIME, byteArrayOf(1))
+        log("Workout IMU capture: requested ON (unverified resume command)")
+        return true
+    }
+
+    /** Stop the workout-window capture and restore the normal stopped-flood state. Always safe to
+     *  call — including when capture was never active, already stopped, or the family isn't WHOOP4 —
+     *  so callers (AppViewModel's endWorkout/discardWorkout) can call it unconditionally. */
+    @Synchronized
+    fun stopWorkoutImuCapture() {
+        workoutImuCaptureActive = false
+        if (connectedFamily == DeviceFamily.WHOOP4 && gatt != null && cmdCharacteristic != null) {
+            send(CommandNumber.SEND_R10_R11_REALTIME, byteArrayOf(0))
+        }
+        log("Workout IMU capture: requested OFF (${workoutImuSamples.size} samples captured)")
+        refreshConnectionPriority()
+    }
+
+    /** Take (and clear) whatever was captured since [startWorkoutImuCapture], paired with the elapsed
+     *  wall-clock duration — the shape [com.noop.analytics.ImuFeatureExtractor.stepsInWindow] needs.
+     *  Null when nothing was captured: the resume command likely had no effect on this hardware,
+     *  capture was never started, or this was already called once (it consumes the buffer). Read-once
+     *  by design — there is no persisted copy to re-read later. */
+    @Synchronized
+    fun takeWorkoutImuCapture(): Pair<List<RawImuSample>, Double>? {
+        val startedAt = workoutImuCaptureStartMs
+        workoutImuCaptureStartMs = 0L
+        if (workoutImuSamples.isEmpty() || startedAt == 0L) return null
+        val samples = ArrayList(workoutImuSamples)
+        workoutImuSamples.clear()
+        val durationSec = (System.currentTimeMillis() - startedAt) / 1000.0
+        return if (durationSec > 0) samples to durationSec else null
+    }
+
+    /** Decode + accumulate a WHOOP4 realtime raw-IMU frame while a workout capture is active. Cheap
+     *  no-op otherwise (wrong family, capture not active, or the frame isn't the 1917-byte IMU
+     *  variant) — safe to call unconditionally for every inbound frame. */
+    @Synchronized
+    private fun recordWorkoutImuFrame(frame: ByteArray) {
+        if (!workoutImuCaptureActive || connectedFamily != DeviceFamily.WHOOP4) return
+        val decoded = com.noop.protocol.Whoop4RawImu.decode(frame, System.currentTimeMillis()) ?: return
+        if (workoutImuSamples.size < maxWorkoutImuSamples) workoutImuSamples.addAll(decoded.samples)
     }
 
     /** Frame reassembler for the fragmented custom notify chars (port of Reassembler). Reassigned per
@@ -7366,6 +7465,9 @@ class WhoopBleClient(
                     noteUnbondedProbeFrame(parsed)
                     // A frame replayed as part of the historical offload (type 47/48/… during a backfill)
                     recordGroundTruthImuFrame(frame)
+                    // WHOOP4 workout-window capture (Tier 1, Experimental): cheap no-op unless a
+                    // tracked-workout capture is actually active on a WHOOP4 link (see the function doc).
+                    recordWorkoutImuFrame(frame)
                     // must not drive LIVE-only state (the charging pill). (PR #568 reimpl)
                     //
                     // NOT the same shape as iOS, despite what this said before. THIS side calls the handler

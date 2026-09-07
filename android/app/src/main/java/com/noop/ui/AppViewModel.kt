@@ -1433,6 +1433,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     private val _lastWorkout = MutableStateFlow<WorkoutRow?>(null)
     val lastWorkout: StateFlow<WorkoutRow?> = _lastWorkout.asStateFlow()
 
+    /** Tier 1 WHOOP4 estimate for the workout [_lastWorkout] just carried (Experimental, opt-in;
+     *  see [workoutStepsFromImu]). Cleared alongside [_lastWorkout] at every site that clears it, so
+     *  the two never disagree about which workout they describe. Deliberately separate from
+     *  [WorkoutRow.steps] — this never gets written to the row or any table. */
+    private val _lastWorkoutImuSteps = MutableStateFlow<Int?>(null)
+    val lastWorkoutImuSteps: StateFlow<Int?> = _lastWorkoutImuSteps.asStateFlow()
+
     /** One-shot: the Today "workout in progress" indicator card raises this (via [openActiveWorkout]) so the
      *  Live screen presents the in-exercise overlay for an ALREADY-RUNNING workout. The overlay normally only
      *  opens at workout start (StartWorkoutSheet), so this is the single path that re-opens it for a session
@@ -1479,9 +1486,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     fun startWorkout(sport: Sport = WorkoutSport.default, gpsEnabled: Boolean = false) {
         if (_activeWorkout.value != null) return
         _lastWorkout.value = null
+        _lastWorkoutImuSteps.value = null
         val startMs = System.currentTimeMillis()
         _activeWorkout.value = ActiveWorkout(startMs = startMs, sport = sport, gpsEnabled = gpsEnabled)
         buzz(1, HapticPrefs.WORKOUT)
+        // Tier 1 WHOOP4 estimate (Experimental, opt-in, default OFF): best-effort resume of the raw-IMU
+        // flood for this workout's duration. No-op when the toggle is off, the connected family isn't
+        // WHOOP4, or the band isn't connected — see startWorkoutImuCapture's own doc for why an
+        // accepted command here is not evidence the flood actually resumed.
+        if (PuffinExperiment.from(appContext).workoutImuStepsWhoop4) {
+            runCatching { ble.startWorkoutImuCapture() }
+        }
         // Workouts & GPS test mode (Test Centre): one session-start line tagged .workouts. Zero-cost when off.
         emitWorkoutsTrace {
             com.noop.analytics.WorkoutsTrace.sessionLine(
@@ -1593,11 +1608,15 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         _activeWorkout.value = null
         gpsJob?.cancel(); gpsJob = null
         activeWorkoutStore.clear()
+        // Unconditional and always safe (a no-op when capture was never started, already stopped, or
+        // the family isn't WHOOP4) — mirrors how GPS teardown above is unconditional too.
+        runCatching { ble.stopWorkoutImuCapture() }
         if (w.gpsEnabled) {
             GpsSession.stop()
             if (!NoopPrefs.backgroundConnection(appContext)) WhoopConnectionService.stop(appContext)
         }
         _lastWorkout.value = null
+        _lastWorkoutImuSteps.value = null
     }
 
     /** Finish the active workout: score the captured HR window + finalize the GPS route, save a
@@ -1610,6 +1629,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Drop the durable non-GPS snapshot the instant the session ends — whether it saves below or is
         // discarded as too-short — so a relaunch never rehydrates an already-finished session (#529).
         activeWorkoutStore.clear()
+        // Unconditional and always safe (a no-op when capture was never started, already stopped, or
+        // the family isn't WHOOP4) — taken BEFORE workoutStepsFromImu below reads the buffer, so the
+        // flood is off before the step estimate is derived from whatever it collected.
+        runCatching { ble.stopWorkoutImuCapture() }
         // The process-level session is authoritative for the route: it kept accumulating even if this
         // ViewModel was cleared mid-ride (screen off), so [w.track] may be stale. Stop it and take its
         // final track. A non-GPS workout has nothing in the session, so fall back to the local track. (#215)
@@ -1632,6 +1655,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
             _lastWorkout.value = null
+            _lastWorkoutImuSteps.value = null
             return
         }
         val endMs = System.currentTimeMillis()
@@ -1669,6 +1693,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
             routePolyline = if (track.size >= 2) RouteMath.encode(track) else null,
         )
         _lastWorkout.value = row
+        // Tier 1 WHOOP4 estimate (Experimental, opt-in): honestly null unless the toggle is on AND the
+        // resume command actually worked on this hardware — see workoutStepsFromImu's own doc. Never
+        // written to `row`/WorkoutRow.steps.
+        _lastWorkoutImuSteps.value = workoutStepsFromImu(w.startMs / 1000, endMs / 1000)
         // Workouts & GPS test mode: one session-end summary tagged .workouts (the lastSessionSummary readout
         // source) carrying the captured HR window size, the duration, and the accepted GPS point count (the
         // final track), so the lifecycle of a saved session is visible end to end. Zero-cost when off.
@@ -2077,6 +2105,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         val ticks = com.noop.analytics.StepsCounter.stepsInWindow(samples) ?: return null
         val scaled = (ticks.toDouble() / maxOf(profileStore.stepTicksPerStep, 0.5)).roundToInt()
         return if (scaled > 0) scaled else null
+    }
+
+    /**
+     * Steps for a manual workout window `[from, to]`, the WHOOP 4.0 analogue of [workoutSteps] — same
+     * (from, to) shape, for API consistency, but genuinely NOT the same kind of source. [workoutSteps]
+     * re-reads a persisted `stepSample` table and can be called anytime later; this has no persisted
+     * table behind it at all (in-memory only, by design — see [WhoopBleClient.takeWorkoutImuCapture]),
+     * so it can only succeed once, at the moment the in-memory capture buffer is taken — in practice,
+     * only from [endWorkout] right when the workout ends. A much later call, after the buffer has
+     * already been consumed or the process has restarted, honestly returns null: the same "nothing to
+     * report" contract [workoutSteps] uses for a window with no strap counter, just for a different
+     * reason (no in-memory capture available, rather than no hardware counter at all).
+     *
+     * Experimental and opt-in (default OFF): gated on [PuffinExperiment.workoutImuStepsWhoop4]. This is
+     * a cadence-derived ESTIMATE ([ImuFeatureExtractor.stepsInWindow], autocorrelation over the raw
+     * accelerometer), never a validated step counter — callers must label it as an estimate wherever
+     * shown, the same posture docs/RAW_DATA_CAPTURE.md holds for raw IMU generally.
+     *
+     * Fails safely: [WhoopBleClient.startWorkoutImuCapture]'s resume command is UNVERIFIED on real
+     * hardware (only the stop direction of SEND_R10_R11_REALTIME is confirmed — see
+     * docs/BLE_REVERSE_ENGINEERING.md §4). If it silently had no effect, zero samples were captured and
+     * this returns null exactly like a window with no data, never a fabricated number. Never writes to
+     * `WorkoutRow.steps` or any table — see [_lastWorkoutImuSteps] for where the result actually goes.
+     */
+    fun workoutStepsFromImu(from: Long, to: Long): Int? {
+        if (to <= from) return null
+        if (!PuffinExperiment.from(appContext).workoutImuStepsWhoop4) return null
+        val (samples, durationSec) = ble.takeWorkoutImuCapture() ?: run {
+            ble.externalLog(
+                "Workout IMU steps: no samples captured for [$from, $to] — resume command likely had no effect on this hardware",
+            )
+            return null
+        }
+        val steps = com.noop.analytics.ImuFeatureExtractor.stepsInWindow(samples, sampleRateHz = 100, durationSec = durationSec)
+        ble.externalLog(
+            "Workout IMU steps: ${steps ?: "no cadence found"} (estimate) from ${samples.size} samples over ${"%.0f".format(durationSec)}s",
+        )
+        return steps
     }
 
     /** Save a retroactive / edited manual workout, then reload. [replacing] is the original on edit. */

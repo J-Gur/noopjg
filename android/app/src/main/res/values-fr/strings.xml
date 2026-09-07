@@ -2739,4 +2739,6 @@
     <string name="workout_server_notif_title">Serveur de contrôle d’entraînement actif</string>
     <string name="workout_server_notif_detail">Accessible sur votre WiFi au port %1$d</string>
     <string name="workout_server_channel_name">Serveur de contrôle d’entraînement</string>
+    <string name="settings_workout_imu_steps_title">Estimation des pas à l’entraînement (WHOOP 4.0)</string>
+    <string name="settings_workout_imu_steps_desc">Une WHOOP 4.0 n’a aucun compteur de pas matériel, contrairement à la 5/MG. Si activé, NOOP demande au bracelet de reprendre son flux de mouvement en direct pendant la durée d’un entraînement suivi et en estime un nombre de pas — une estimation approximative, pas un compte validé, et seulement pour cet entraînement. Envoie une commande non vérifiée au bracelet ; si elle n’a aucun effet, aucune estimation n’est affichée, jamais une erronée. Désactivé par défaut et sans effet sur une 5/MG.</string>
 </resources>

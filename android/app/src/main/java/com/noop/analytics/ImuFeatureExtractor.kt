@@ -94,4 +94,25 @@ object ImuFeatureExtractor {
         val rate = frames.firstOrNull()?.sampleRateHz ?: 100
         return extract(frames.flatMap { it.samples }, rate)
     }
+
+    /**
+     * A rough step-COUNT estimate for a bounded window: the window's dominant cadence (steps/sec, from
+     * [extract]) times [durationSec]. Deliberately simple — not a per-step peak counter — and this is a
+     * separate, additive function so [extract]'s own tested/parity-locked cadence-feature output is
+     * never touched.
+     *
+     * Null whenever [extract] finds no cadence peak clearing [minCadenceStrength] (too little, or no,
+     * rhythmic motion) or [durationSec] is non-positive — the same honest-null convention
+     * [com.noop.analytics.StepsCounter.stepsInWindow] uses for the 5/MG's real hardware counter, so a
+     * caller can treat both sources identically. This is an ESTIMATE derived from a cadence feature,
+     * not a validated step counter: callers must gate it behind an Experimental opt-in and label it as
+     * an estimate wherever shown (see `PuffinExperiment.workoutImuStepsWhoop4` and
+     * `AppViewModel.workoutStepsFromImu`).
+     */
+    fun stepsInWindow(samples: List<RawImuSample>, sampleRateHz: Int, durationSec: Double): Int? {
+        if (durationSec <= 0) return null
+        val cadenceHz = extract(samples, sampleRateHz).cadenceHz ?: return null
+        val steps = (cadenceHz * durationSec).roundToInt()
+        return steps.takeIf { it > 0 }
+    }
 }

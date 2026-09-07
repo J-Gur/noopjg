@@ -629,6 +629,10 @@ fun SettingsScreen(
     // "Motion-aware wake refinement" (#364 follow-up) — OFF by default. Self-gates on observed gravity +
     // step density, so it is a no-op on a sparse (e.g. WHOOP 4.0) night regardless of this switch.
     var motionAwareWake by remember { mutableStateOf(puffinExperiment.motionAwareWake) }
+    // "Workout step estimate (WHOOP 4.0)" (Tier 1 raw-IMU estimate) — OFF by default. WHOOP4-only (a
+    // 4.0 has no hardware step counter at all, unlike the 5/MG's @57 counter); sends an UNVERIFIED
+    // resume command to the strap's live raw-IMU stream for a tracked workout's duration.
+    var workoutImuStepsWhoop4 by remember { mutableStateOf(puffinExperiment.workoutImuStepsWhoop4) }
 
     // Whether to surface the WHOOP 5/MG-only probes (puffin / R22 / broadcast-HR / frame-capture). Gated
     // so a confident 4.0 owner never sees 5/MG controls that can't touch their strap (#22). The model
@@ -2974,6 +2978,42 @@ fun SettingsScreen(
                         "into light sleep; a real get-up is left alone. Self-checks how much motion detail " +
                         "your strap actually recorded and stays off on a night that's too sparse to trust " +
                         "(older WHOOP 4.0 firmware, mainly). Off by default; takes effect on the next nights staged.",
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
+
+                // --- Workout step estimate (WHOOP 4.0) — Tier 1 raw-IMU estimate, OFF by default. ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        uiString(R.string.settings_workout_imu_steps_title),
+                        style = NoopType.subhead,
+                        color = Palette.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = workoutImuStepsWhoop4,
+                        onCheckedChange = {
+                            workoutImuStepsWhoop4 = it
+                            puffinExperiment.workoutImuStepsWhoop4 = it
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                        modifier = Modifier.semantics {
+                            contentDescription = uiString(R.string.settings_workout_imu_steps_title)
+                        },
+                    )
+                }
+                Text(
+                    uiString(R.string.settings_workout_imu_steps_desc),
                     style = NoopType.caption,
                     color = Palette.textTertiary,
                 )

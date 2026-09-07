@@ -2732,4 +2732,6 @@
     <string name="workout_server_notif_title">Servidor de controlo de treino em execução</string>
     <string name="workout_server_notif_detail">Acessível na tua WiFi na porta %1$d</string>
     <string name="workout_server_channel_name">Servidor de controlo de treino</string>
+    <string name="settings_workout_imu_steps_title">Estimativa de passos do treino (WHOOP 4.0)</string>
+    <string name="settings_workout_imu_steps_desc">Uma WHOOP 4.0 não tem qualquer contador de passos por hardware, ao contrário da 5/MG. Quando ativado, a NOOP pede à banda para retomar o seu fluxo de movimento em direto durante a duração de um treino registado e estima uma contagem de passos a partir disso — uma estimativa aproximada, não uma contagem validada, e apenas para esse treino. Envia um comando não verificado à banda; se não tiver efeito, não é mostrada nenhuma estimativa, nunca uma errada. Desativado por predefinição e sem efeito numa 5/MG.</string>
 </resources>

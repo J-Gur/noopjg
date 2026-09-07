@@ -232,6 +232,26 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         get() = prefs.getBoolean(KEY_CLEAR_STALE_BOND, false)
         set(v) { prefs.edit().putBoolean(KEY_CLEAR_STALE_BOND, v).apply() }
 
+    /**
+     * "Workout step estimate (WHOOP 4.0)" opt-in (default false, Tier 1 raw-IMU step count). A WHOOP
+     * 4.0 has no hardware step counter at all (unlike the 5/MG's @57 counter behind [StepsCounter] /
+     * `AppViewModel.workoutSteps`) — this instead resumes the 4.0's live type-43 raw-IMU flood
+     * ([WhoopBleClient.startWorkoutImuCapture]) for the duration of a tracked workout and derives a
+     * cadence-based step-count ESTIMATE from it ([ImuFeatureExtractor.stepsInWindow]).
+     *
+     * Its own dedicated switch, not a reuse of [isEnabled] or any other probe here, for the same reason
+     * every state-changing probe in this file gets one: [isEnabled] is documented as 5/MG-only ("It
+     * never touches WHOOP 4.0") and reusing it for a WHOOP4-only, hardware-sending feature would let
+     * consent for one probe cover an unrelated one. Own key, own doc, own risk: this SENDS a resume
+     * command to the strap whose effect is UNVERIFIED on real hardware (only the stop direction of
+     * SEND_R10_R11_REALTIME is confirmed — see docs/BLE_REVERSE_ENGINEERING.md §4); if it silently
+     * doesn't work, no samples arrive and the estimate is honestly null, never fabricated. In-memory
+     * only — no permanent storage, and the result never writes to `WorkoutRow.steps`.
+     */
+    var workoutImuStepsWhoop4: Boolean
+        get() = prefs.getBoolean(KEY_WORKOUT_IMU_STEPS_WHOOP4, false)
+        set(v) = prefs.edit().putBoolean(KEY_WORKOUT_IMU_STEPS_WHOOP4, v).apply()
+
     companion object {
         /** Persisted preferences file. Internal so a UI screen can observe external writes to it. */
         internal const val PREFS = "noop_experiments"
@@ -283,6 +303,10 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
 
         /** "Motion-aware wake refinement" opt-in (mirrors macOS `PuffinExperiment.motionAwareWakeKey`). */
         const val KEY_MOTION_AWARE_WAKE = "noopMotionAwareWake"
+
+        /** "Workout step estimate (WHOOP 4.0)" opt-in — the Tier 1 raw-IMU step-count estimate.
+         *  Android-only for now (no macOS key to mirror yet). */
+        const val KEY_WORKOUT_IMU_STEPS_WHOOP4 = "noopWorkoutImuStepsWhoop4"
 
         fun from(context: Context): PuffinExperiment =
             PuffinExperiment(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))
