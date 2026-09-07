@@ -50,6 +50,7 @@ import com.noop.notif.StrainTargetNotifier
 import com.noop.notif.ScheduledReportPolicy
 import com.noop.notif.scorePctOrNull
 import com.noop.protocol.CommandNumber
+import com.noop.server.WorkoutServerService
 import com.noop.widget.WidgetSnapshot
 import com.noop.widget.WidgetSnapshotStore
 import kotlinx.coroutines.Dispatchers
@@ -131,6 +132,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val ble = noopApp.ble
 
     val repo: WhoopRepository get() = repository
+
+    /** Phase 2 (local workout-control web server): publish this instance so [WorkoutServerService]'s
+     *  HTTP handler — which cannot hold a ViewModel reference of its own — can reach [startWorkout] /
+     *  [endWorkout] for a request coming from another device on the LAN. Cleared in [onCleared], so a
+     *  server request arriving after the Activity is gone gets an honest "app not open" response
+     *  instead of touching a dead instance. Starting the server here (not at process start) keeps it on
+     *  the same safe, always-foreground call path [WhoopConnectionService] already uses, and means the
+     *  control page only becomes reachable once the app has actually been opened. */
+    init {
+        ActiveAppViewModel.current = this
+        WorkoutServerService.start(appContext)
+    }
 
     /** The registry's active strap id (the same id the read path resolves to). The getter stays source
      * compatible for existing call sites; reactive screens collect [activeStrapIdFlow]. */
@@ -3021,6 +3034,14 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // convenience (read your strap HR on nearby gym kit), not a background service. A relaunch
         // re-resumes it from the persisted toggle.
         broadcaster.stop()
+        // Phase 2 workout-control server: only this ViewModel's own registration counts as "still
+        // live" — a newer Activity's AppViewModel may already have replaced the pointer by the time
+        // this one is torn down (e.g. a fast re-create), and clearing it here would wrongly orphan
+        // the new instance's server requests.
+        if (ActiveAppViewModel.current === this) {
+            ActiveAppViewModel.current = null
+            WorkoutServerService.stop(appContext)
+        }
     }
 
     private companion object {
@@ -3044,6 +3065,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         /** SharedPreferences key for the persisted double-tap action (stored as the enum NAME). */
         const val DOUBLE_TAP_ACTION_KEY = "noop.doubleTapAction"
     }
+}
+
+/**
+ * Holds the currently-live [AppViewModel] instance, for background entry points that cannot hold a
+ * ViewModel reference of their own — currently only [com.noop.server.WorkoutHttpServer], which runs
+ * on a plain [android.app.Service] with no ViewModelStoreOwner. Set in [AppViewModel]'s init and
+ * cleared in [AppViewModel.onCleared], so [current] is null whenever no Activity is hosting the
+ * ViewModel (e.g. the app was swiped away) — callers MUST treat null as "app not open" rather than
+ * assuming it is always reachable.
+ */
+object ActiveAppViewModel {
+    @Volatile var current: AppViewModel? = null
 }
 
 /**
