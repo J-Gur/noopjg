@@ -5131,6 +5131,10 @@ private fun MetricGrid(
                         windowDays = windowDays,
                         onClick = tapFor(metric),
                         modifier = Modifier.weight(1f).then(if (detailed) Modifier.fillMaxHeight() else Modifier),
+                        // Steps/Calories get the size/prominence bump (see LiquidKeyTile's `prominent`
+                        // doc) — same grid slot, same reorder/hide behavior, just a bigger number and a
+                        // tinted card so they read as more important than a plain vital readout.
+                        prominent = metric == KeyMetric.STEPS || metric == KeyMetric.CALORIES,
                     )
                 }
                 repeat(3 - rowTiles.size) { Spacer(Modifier.weight(1f)) }
@@ -5222,6 +5226,13 @@ private fun LiquidKeyTile(
     windowDays: Int = 14,
     onClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
+    // Steps/Calories-only size/prominence variant (see the call site in the Key Metrics grid below):
+    // a bigger value numeral, a slightly bigger glyph, and the tile's own tint washed into the card
+    // background (frostedCardSurface's existing `tint` param — no new visual mechanism). Everything
+    // else — the grid's 3-column chunking, per-tile weight(1f), the S5 reorder/hide editor, row height
+    // equalisation — is untouched, so this only changes how these two cells look, never the layout
+    // rules the rest of the customizable grid depends on.
+    prominent: Boolean = false,
 ) {
     val hasValue = data.value != NO_DATA
     val displayValue = localizedMetricValue(data.value)
@@ -5239,8 +5250,8 @@ private fun LiquidKeyTile(
     Column(
         modifier = base
             .clip(RoundedCornerShape(16.dp))
-            .frostedCardSurface(cornerRadius = 16.dp)
-            .padding(horizontal = 12.dp, vertical = 11.dp)
+            .frostedCardSurface(cornerRadius = 16.dp, tint = if (prominent) data.tint else null)
+            .padding(horizontal = 12.dp, vertical = if (prominent) 14.dp else 11.dp)
             .semantics { contentDescription = uiString(R.string.l10n_today_screen_data_label_data_value_data_unit_27f6fd6b, data.label, displayValue, data.unit).trim() },
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
@@ -5255,7 +5266,7 @@ private fun LiquidKeyTile(
                 icon,
                 contentDescription = null,
                 tint = data.tint.copy(alpha = 0.72f),
-                modifier = Modifier.size(12.dp),
+                modifier = Modifier.size(if (prominent) 15.dp else 12.dp),
             )
             Text(
                 data.label.uppercase(),
@@ -5269,14 +5280,14 @@ private fun LiquidKeyTile(
         Row(verticalAlignment = Alignment.Bottom) {
             Text(
                 displayValue,
-                style = NoopType.number(17f),
+                style = NoopType.number(if (prominent) 30f else 17f),
                 color = if (hasValue) Palette.textPrimary else Palette.textTertiary,
                 maxLines = 1,
             )
             if (data.unit.isNotEmpty() && hasValue) {
                 Text(
                     uiString(R.string.l10n_today_screen_data_unit_c768ef8c, data.unit),
-                    style = NoopType.caption,
+                    style = if (prominent) NoopType.body else NoopType.caption,
                     color = Palette.textPrimary,
                     maxLines = 1,
                 )

@@ -93,6 +93,11 @@ fun StartWorkoutSheet(vm: AppViewModel, onDismiss: () -> Unit) {
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        // Pinned to match LiveWorkoutScreen's own dialogs (the very next screen in this flow): left on
+        // the M3 theme default, this sheet's surface renders as `surfaceRaised` (the noopColorScheme
+        // `surface` slot) while LiveWorkoutScreen's pause/delete dialogs explicitly use `surfaceOverlay`
+        // — a visible background-shade mismatch between two dialogs seen back-to-back in the same flow.
+        containerColor = Palette.surfaceOverlay,
         title = { Text(uiString(R.string.l10n_workout_start_start_a_workout_32caf94d)) },
         text = {
             Column {
