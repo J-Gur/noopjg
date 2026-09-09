@@ -128,6 +128,11 @@
     <uses-permission android:name="android.permission.health.WRITE_EXERCISE" />
     <uses-permission android:name="android.permission.health.WRITE_DISTANCE" />
     <uses-permission android:name="android.permission.health.READ_VO2_MAX" />
+    <!-- hcWritePermissionLauncher batches VO2MAX_PERMISSIONS into the SAME request as the vitals +
+         exercise write permissions above (DataSourcesScreen.kt startWriteback()). MUST be declared or
+         Health Connect silently drops the WHOLE batched request — same trap as #412 above — which is
+         why writeback kept failing PERMISSION_DENIED even after granting everything else. -->
+    <uses-permission android:name="android.permission.health.WRITE_VO2_MAX" />
     <uses-permission android:name="android.permission.health.READ_WEIGHT" />
     <uses-permission android:name="android.permission.health.READ_BODY_FAT" />
     <uses-permission android:name="android.permission.health.READ_LEAN_BODY_MASS" />
