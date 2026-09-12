@@ -84,12 +84,27 @@ internal fun latestWeightKg(apple: List<AppleDaily>, healthConnect: List<AppleDa
  * rather than "No Data". On-device WHOOP 5/MG steps (DailyMetric.steps) still take precedence at the
  * call site. When both sources report the same day, the larger (most-complete) total wins so we never
  * sum and double-count. Mirrors the macOS TodayView, which already falls back to imported steps. (#150)
+ *
+ * [manualHttp] (the opt-in `/steps` HTTP receiver, deviceId "manual-http") is a SEPARATE, LOWER
+ * fallback tier, not blended into the apple/healthConnect max above: it only fills a day neither of
+ * those two covers at all, so a real Health Connect sync — if it starts working again — always wins
+ * over a manually-entered count for the same day, never gets averaged/maxed against it.
  */
-internal fun stepsForDay(apple: List<AppleDaily>, healthConnect: List<AppleDaily>, dayKey: String): Int? =
-    (apple + healthConnect)
+internal fun stepsForDay(
+    apple: List<AppleDaily>,
+    healthConnect: List<AppleDaily>,
+    dayKey: String,
+    manualHttp: List<AppleDaily> = emptyList(),
+): Int? {
+    val fromSync = (apple + healthConnect)
         .filter { it.day == dayKey }
         .mapNotNull { it.steps }
         .maxOrNull()
+    return fromSync ?: manualHttp
+        .filter { it.day == dayKey }
+        .mapNotNull { it.steps }
+        .maxOrNull()
+}
 
 /**
  * Resolve the Weight tile text: prefer the latest Apple/Health-Connect weight, else fall back to the

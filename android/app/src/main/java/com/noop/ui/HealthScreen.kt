@@ -2470,8 +2470,11 @@ private suspend fun buildSeriesVitalDetail(vm: AppViewModel, key: String): Vital
             strapDeviceId = vm.activeStrapId)
             .points.associateBy({ it.day }, { VitalReading(it.day, it.value, it.source) })
         val imported = LinkedHashMap<String, VitalReading>()
+        // "manual-http" (the opt-in /steps HTTP receiver) is appended LAST: putIfAbsent means it only
+        // fills a day neither apple-health nor health-connect already has, never overrides a real sync.
         for (r in vm.repo.appleDaily("apple-health", "0000-01-01", "9999-12-31") +
-            vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31")) {
+            vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31") +
+            vm.repo.appleDaily("manual-http", "0000-01-01", "9999-12-31")) {
             val s = r.steps
             if (s != null && s > 0) imported.putIfAbsent(r.day, VitalReading(r.day, s.toDouble(), r.deviceId))
         }

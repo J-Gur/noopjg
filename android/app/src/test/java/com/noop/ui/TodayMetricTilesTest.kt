@@ -125,6 +125,31 @@ class TodayMetricTilesTest {
         assertEquals(9500, stepsForDay(apple, hc, "2026-01-04"))
     }
 
+    // MARK: stepsForDay — the "manual-http" fallback tier (the opt-in /steps HTTP receiver)
+
+    @Test
+    fun stepsForDay_manualHttp_fillsADayNeitherSyncSourceCovers() {
+        val manualHttp = listOf(stepsDay("manual-http", "2026-01-05", 7700))
+        assertEquals(7700, stepsForDay(emptyList(), emptyList(), "2026-01-05", manualHttp))
+    }
+
+    @Test
+    fun stepsForDay_manualHttp_neverOverridesARealSyncForTheSameDay() {
+        // apple-health has a (smaller) real count for the day; manual-http must NOT win even though its
+        // number is larger — it is a gap-filler, not a third candidate blended into the max.
+        val apple = listOf(stepsDay("apple-health", "2026-01-06", 4000))
+        val manualHttp = listOf(stepsDay("manual-http", "2026-01-06", 12000))
+        assertEquals(4000, stepsForDay(apple, emptyList(), "2026-01-06", manualHttp))
+    }
+
+    @Test
+    fun stepsForDay_manualHttp_defaultsToEmptyForExistingCallSites() {
+        // The new parameter must be source-compatible: every pre-existing 3-arg call site keeps working
+        // unchanged, and behaves exactly as if manualHttp were empty.
+        val apple = listOf(stepsDay("apple-health", "2026-01-07", 5000))
+        assertEquals(stepsForDay(apple, emptyList(), "2026-01-07"), stepsForDay(apple, emptyList(), "2026-01-07", emptyList()))
+    }
+
     // MARK: buildingHint — the unscored Effort/Rest "it's coming" caption, today-only (#527)
 
     @Test

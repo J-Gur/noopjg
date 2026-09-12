@@ -103,8 +103,10 @@ import androidx.compose.foundation.gestures.drag
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.pluralStringResource
@@ -112,6 +114,7 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -130,6 +133,7 @@ import com.noop.analytics.Zones
 import com.noop.R
 import com.noop.ble.PuffinExperiment
 import com.noop.ble.WhoopBleClient
+import com.noop.server.WorkoutHttpServer
 // #174: the R22 card reads the flag COUNT off Whoop5Config.enableR22Sequence rather than restating it —
 // the hardcoded "15" outlived the sequence growing to 16 and declared success a flag early.
 import com.noop.protocol.Whoop5Config
@@ -633,6 +637,10 @@ fun SettingsScreen(
     // 4.0 has no hardware step counter at all, unlike the 5/MG's @57 counter); sends an UNVERIFIED
     // resume command to the strap's live raw-IMU stream for a tracked workout's duration.
     var workoutImuStepsWhoop4 by remember { mutableStateOf(puffinExperiment.workoutImuStepsWhoop4) }
+    // "Manual steps via HTTP" — OFF by default. Arms WorkoutHttpServer's /steps route, a same-WiFi
+    // workaround for a broken Health Connect sync (e.g. an iOS Shortcut posting Apple Health's step
+    // count). Never overrides a real apple-health/health-connect day, only fills a gap neither covers.
+    var manualHttpSteps by remember { mutableStateOf(puffinExperiment.manualHttpSteps) }
 
     // Whether to surface the WHOOP 5/MG-only probes (puffin / R22 / broadcast-HR / frame-capture). Gated
     // so a confident 4.0 owner never sees 5/MG controls that can't touch their strap (#22). The model
@@ -3017,6 +3025,61 @@ fun SettingsScreen(
                     style = NoopType.caption,
                     color = Palette.textTertiary,
                 )
+
+                // --- Manual steps via HTTP — OFF by default. ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                ) {
+                    Text(
+                        uiString(R.string.settings_manual_http_steps_title),
+                        style = NoopType.subhead,
+                        color = Palette.textPrimary,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Switch(
+                        checked = manualHttpSteps,
+                        onCheckedChange = {
+                            manualHttpSteps = it
+                            puffinExperiment.manualHttpSteps = it
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = Palette.surfaceBase,
+                            checkedTrackColor = Palette.accent,
+                            uncheckedThumbColor = Palette.textSecondary,
+                            uncheckedTrackColor = Palette.surfaceInset,
+                            uncheckedBorderColor = Palette.hairline,
+                        ),
+                        modifier = Modifier.semantics {
+                            contentDescription = uiString(R.string.settings_manual_http_steps_title)
+                        },
+                    )
+                }
+                Text(
+                    uiString(R.string.settings_manual_http_steps_desc),
+                    style = NoopType.caption,
+                    color = Palette.textTertiary,
+                )
+                // The token + URL only matter once the switch is on — showing them earlier would suggest
+                // the endpoint is already live when it isn't (the /steps route itself checks the same
+                // toggle, so this is display-only, never the actual gate).
+                if (manualHttpSteps) {
+                    val clipboard = LocalClipboardManager.current
+                    val exampleUrl = "http://<phone-ip>:${WorkoutHttpServer.PORT}/steps?date=YYYY-MM-DD&count=N&token=${puffinExperiment.manualHttpStepsToken}"
+                    SelectionContainer {
+                        Text(
+                            exampleUrl,
+                            style = NoopType.caption.copy(fontFamily = FontFamily.Monospace),
+                            color = Palette.textSecondary,
+                        )
+                    }
+                    NoopButton(
+                        text = uiString(R.string.settings_manual_http_steps_copy_url),
+                        kind = NoopButtonKind.Secondary,
+                        onClick = { clipboard.setText(AnnotatedString(exampleUrl)) },
+                    )
+                }
 
                 // --- #103/queue-11a: Blood Oxygen strap estimate — OFF by default. ---
                 // Device-conditional (see IntelligenceEngine.nightlySpo2CeilingMean / .nightlySpo2CandidateMean):

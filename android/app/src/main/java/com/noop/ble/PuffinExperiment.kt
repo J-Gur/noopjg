@@ -252,7 +252,42 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         get() = prefs.getBoolean(KEY_WORKOUT_IMU_STEPS_WHOOP4, false)
         set(v) = prefs.edit().putBoolean(KEY_WORKOUT_IMU_STEPS_WHOOP4, v).apply()
 
+    /**
+     * "Manual steps via HTTP" opt-in (default false). Arms `WorkoutHttpServer`'s `/steps` route, which
+     * lets a same-WiFi device (e.g. an iOS Shortcut reading Apple Health) push a day's step count into
+     * NOOP directly — a workaround for a broken Health Connect sync, not a replacement for it (see
+     * `TodayMetricsLogic.stepsForDay`'s "manual-http" fallback tier, which only fills a day neither
+     * apple-health nor health-connect already covers).
+     *
+     * Own dedicated switch, same reasoning as every other probe here: this opens a NETWORK-FACING write
+     * path into permanent health data, which is a materially bigger trust boundary than `/start`/`/stop`
+     * (a control signal into logic the user can immediately undo) — it must never piggyback on consent
+     * given for an unrelated feature.
+     */
+    var manualHttpSteps: Boolean
+        get() = prefs.getBoolean(KEY_MANUAL_HTTP_STEPS, false)
+        set(v) = prefs.edit().putBoolean(KEY_MANUAL_HTTP_STEPS, v).apply()
+
+    /**
+     * The shared-secret token `/steps` requires as a query param — generated once (a random 24-character
+     * alphanumeric string, ~142 bits of entropy) and persisted, so the SAME token survives app restarts
+     * and only needs copying into the Shortcut once. Not real authentication (the endpoint is still
+     * plain HTTP on the local network, matching every other route in `WorkoutHttpServer`) — just enough
+     * that a stray device on the same WiFi can't silently write bogus step counts into permanent health
+     * data without at least having copied this value out of Settings first.
+     */
+    val manualHttpStepsToken: String
+        get() = prefs.getString(KEY_MANUAL_HTTP_STEPS_TOKEN, null) ?: generateManualHttpStepsToken()
+
+    private fun generateManualHttpStepsToken(): String {
+        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+        val token = (1..24).map { alphabet[SECURE_RANDOM.nextInt(alphabet.length)] }.joinToString("")
+        prefs.edit().putString(KEY_MANUAL_HTTP_STEPS_TOKEN, token).apply()
+        return token
+    }
+
     companion object {
+        private val SECURE_RANDOM = java.security.SecureRandom()
         /** Persisted preferences file. Internal so a UI screen can observe external writes to it. */
         internal const val PREFS = "noop_experiments"
 
@@ -307,6 +342,13 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
         /** "Workout step estimate (WHOOP 4.0)" opt-in — the Tier 1 raw-IMU step-count estimate.
          *  Android-only for now (no macOS key to mirror yet). */
         const val KEY_WORKOUT_IMU_STEPS_WHOOP4 = "noopWorkoutImuStepsWhoop4"
+
+        /** "Manual steps via HTTP" opt-in — arms WorkoutHttpServer's /steps route. Android-only (no
+         *  macOS key to mirror; the local web dashboard itself is Android-only). */
+        const val KEY_MANUAL_HTTP_STEPS = "noopManualHttpSteps"
+
+        /** The persisted /steps shared-secret token — see [manualHttpStepsToken]. */
+        const val KEY_MANUAL_HTTP_STEPS_TOKEN = "noopManualHttpStepsToken"
 
         fun from(context: Context): PuffinExperiment =
             PuffinExperiment(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE))

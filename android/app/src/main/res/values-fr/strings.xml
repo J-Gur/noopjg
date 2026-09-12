@@ -2741,4 +2741,7 @@
     <string name="workout_server_channel_name">Serveur de contrôle d’entraînement</string>
     <string name="settings_workout_imu_steps_title">Estimation des pas à l’entraînement (WHOOP 4.0)</string>
     <string name="settings_workout_imu_steps_desc">Une WHOOP 4.0 n’a aucun compteur de pas matériel, contrairement à la 5/MG. Si activé, NOOP demande au bracelet de reprendre son flux de mouvement en direct pendant la durée d’un entraînement suivi et en estime un nombre de pas — une estimation approximative, pas un compte validé, et seulement pour cet entraînement. Envoie une commande non vérifiée au bracelet ; si elle n’a aucun effet, aucune estimation n’est affichée, jamais une erronée. Désactivé par défaut et sans effet sur une 5/MG.</string>
+    <string name="settings_manual_http_steps_title">Pas manuels par HTTP</string>
+    <string name="settings_manual_http_steps_desc">Permet à un appareil sur votre WiFi (par ex. un raccourci iPhone lisant Apple Santé) d’envoyer directement à NOOP le nombre de pas d’une journée — une solution de contournement pour une synchronisation Health Connect défaillante, pas un remplacement. Ne comble qu’un jour que ni Apple Santé ni Health Connect ne couvrent déjà ; une vraie synchronisation l’emporte toujours. Nécessite le jeton ci-dessous dans la requête. Désactivé par défaut.</string>
+    <string name="settings_manual_http_steps_copy_url">Copier l’URL d’exemple</string>
 </resources>

@@ -820,6 +820,7 @@ fun TodayScreen(
             viewModel.repo.appleDaily("apple-health", "0000-01-01", "9999-12-31"),
             viewModel.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31"),
             selectedDayKey,
+            viewModel.repo.appleDaily("manual-http", "0000-01-01", "9999-12-31"),
         )
     }
 

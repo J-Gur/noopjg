@@ -2755,4 +2755,7 @@
     <string name="workout_server_channel_name">Workout-Steuerserver</string>
     <string name="settings_workout_imu_steps_title">Schritt-Schätzung für Workouts (WHOOP 4.0)</string>
     <string name="settings_workout_imu_steps_desc">Eine WHOOP 4.0 hat gar keinen Schrittzähler, anders als die 5/MG. Wenn aktiviert, bittet NOOP den Tracker, seinen Live-Bewegungsstream für die Dauer eines aufgezeichneten Workouts fortzusetzen, und schätzt daraus eine Schrittzahl – eine grobe Schätzung, kein validierter Wert, und nur für dieses eine Workout. Sendet einen unbestätigten Befehl an den Tracker; wirkt er nicht, wird keine Schätzung angezeigt, nie eine falsche. Standardmäßig aus und ohne Wirkung auf einer 5/MG.</string>
+    <string name="settings_manual_http_steps_title">Manuelle Schritte per HTTP</string>
+    <string name="settings_manual_http_steps_desc">Lässt ein Gerät in deinem WLAN (z. B. eine iPhone-Kurzbefehl-Aktion, die Apple Health ausliest) eine Tagesschrittzahl direkt an NOOP senden – ein Workaround für eine nicht funktionierende Health-Connect-Synchronisierung, kein Ersatz dafür. Füllt nur einen Tag auf, den weder Apple Health noch Health Connect bereits abdecken; eine echte Synchronisierung gewinnt immer. Erfordert das Token unten als Teil der Anfrage. Standardmäßig aus.</string>
+    <string name="settings_manual_http_steps_copy_url">Beispiel-URL kopieren</string>
 </resources>

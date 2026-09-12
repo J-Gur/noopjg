@@ -2771,4 +2771,7 @@
     <string name="workout_server_channel_name">Workout control server</string>
     <string name="settings_workout_imu_steps_title">Workout step estimate (WHOOP 4.0)</string>
     <string name="settings_workout_imu_steps_desc">A WHOOP 4.0 has no hardware step counter at all, unlike the 5/MG. When on, NOOP asks the strap to resume its live raw-motion stream for the duration of a tracked workout and estimates a step count from it — a rough estimate, not a validated count, and only for that one workout. Sends an unverified command to the strap; if it has no effect, no estimate is shown, never a wrong one. Off by default, and does nothing on a 5/MG strap.</string>
+    <string name="settings_manual_http_steps_title">Manual steps via HTTP</string>
+    <string name="settings_manual_http_steps_desc">Lets a device on your WiFi (e.g. an iPhone Shortcut reading Apple Health) send a day\'s step count straight to NOOP — a workaround for a Health Connect sync that isn\'t working, not a replacement for it. Only fills in a day neither Apple Health nor Health Connect already covers; a real sync always wins. Requires the token below as part of the request. Off by default.</string>
+    <string name="settings_manual_http_steps_copy_url">Copy example URL</string>
 </resources>

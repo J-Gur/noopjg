@@ -225,8 +225,11 @@ internal fun healthPage(vm: AppViewModel): String {
  */
 private suspend fun resolveActivityReadings(vm: AppViewModel): Pair<List<VitalReading>, List<VitalReading>> {
     val deviceId = vm.activeStrapId
+    // "manual-http" (the opt-in /steps HTTP receiver) is appended LAST: the putIfAbsent loops below only
+    // let it fill a day neither apple-health nor health-connect already has, never override a real sync.
     val imported = (vm.repo.appleDaily("apple-health", "0000-01-01", "9999-12-31") +
-        vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31"))
+        vm.repo.appleDaily("health-connect", "0000-01-01", "9999-12-31") +
+        vm.repo.appleDaily("manual-http", "0000-01-01", "9999-12-31"))
 
     val realSteps = vm.repo.resolvedSeries("steps", "my-whoop", "0000-00-00", "9999-99-99", strapDeviceId = deviceId)
         .points.associateBy({ it.day }, { VitalReading(it.day, it.value, it.source) })
