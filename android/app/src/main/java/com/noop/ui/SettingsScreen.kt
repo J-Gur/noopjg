@@ -38,6 +38,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.DirectionsWalk
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Autorenew
 import androidx.compose.material.icons.filled.Bolt
@@ -641,6 +642,11 @@ fun SettingsScreen(
     // workaround for a broken Health Connect sync (e.g. an iOS Shortcut posting Apple Health's step
     // count). Never overrides a real apple-health/health-connect day, only fills a gap neither covers.
     var manualHttpSteps by remember { mutableStateOf(puffinExperiment.manualHttpSteps) }
+    // Mirrored into Compose state (unlike a plain re-read) so tapping "Regenerate" actually refreshes
+    // the displayed token/URL — PuffinExperiment's own getter reads straight from SharedPreferences,
+    // which Compose has no way to observe on its own.
+    var manualHttpStepsToken by remember { mutableStateOf(puffinExperiment.manualHttpStepsToken) }
+    var confirmingManualHttpTokenRegenerate by remember { mutableStateOf(false) }
 
     // Whether to surface the WHOOP 5/MG-only probes (puffin / R22 / broadcast-HR / frame-capture). Gated
     // so a confident 4.0 owner never sees 5/MG controls that can't touch their strap (#22). The model
@@ -2478,6 +2484,59 @@ fun SettingsScreen(
             }
         }
 
+        // Own top-level card, NOT tucked inside the "Advanced" disclosure below — unlike the
+        // Experimental/Puffin probes, this is a feature meant for regular use (a standing workaround for
+        // a Health Connect sync that isn't working), so it stays visible without expanding anything.
+        SettingsCard(
+            icon = Icons.AutoMirrored.Filled.DirectionsWalk,
+            title = uiString(R.string.settings_manual_http_steps_title),
+            blurb = uiString(R.string.settings_manual_http_steps_card_blurb),
+        ) {
+            SettingsToggleRow(
+                title = uiString(R.string.settings_manual_http_steps_title),
+                detail = uiString(R.string.settings_manual_http_steps_desc),
+                checked = manualHttpSteps,
+                onCheckedChange = {
+                    manualHttpSteps = it
+                    puffinExperiment.manualHttpSteps = it
+                },
+            )
+            // The token + URL only matter once the switch is on — showing them earlier would suggest
+            // the endpoint is already live when it isn't (the /steps route itself checks the same
+            // toggle, so this is display-only, never the actual gate).
+            if (manualHttpSteps) {
+                val clipboard = LocalClipboardManager.current
+                val exampleUrl = "http://<phone-ip>:${WorkoutHttpServer.PORT}/steps?date=YYYY-MM-DD&count=N&token=$manualHttpStepsToken"
+                SelectionContainer {
+                    Text(
+                        exampleUrl,
+                        style = NoopType.caption.copy(fontFamily = FontFamily.Monospace),
+                        color = Palette.textSecondary,
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    NoopButton(
+                        text = uiString(R.string.settings_manual_http_steps_copy_token),
+                        kind = NoopButtonKind.Secondary,
+                        onClick = { clipboard.setText(AnnotatedString(manualHttpStepsToken)) },
+                    )
+                    NoopButton(
+                        text = uiString(R.string.settings_manual_http_steps_copy_url),
+                        kind = NoopButtonKind.Secondary,
+                        onClick = { clipboard.setText(AnnotatedString(exampleUrl)) },
+                    )
+                }
+                // A separate, deliberate action rather than something that happens as a side effect of
+                // anything else — regenerating silently breaks an already-configured Shortcut/script
+                // until it's updated with the new value, so it goes through the same confirm-dialog
+                // pattern as other hard-to-reverse actions in this screen (e.g. R22 deep-data disable).
+                NoopButton(
+                    text = uiString(R.string.settings_manual_http_steps_regenerate_token),
+                    kind = NoopButtonKind.Secondary,
+                    onClick = { confirmingManualHttpTokenRegenerate = true },
+                )
+            }
+        }
 
         // Lower-frequency sections collapse behind a single default-closed disclosure (S3) so the
         // screen opens at the everyday handful instead of the full wall of cards. Nothing is removed;
@@ -3026,61 +3085,6 @@ fun SettingsScreen(
                     color = Palette.textTertiary,
                 )
 
-                // --- Manual steps via HTTP — OFF by default. ---
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
-                ) {
-                    Text(
-                        uiString(R.string.settings_manual_http_steps_title),
-                        style = NoopType.subhead,
-                        color = Palette.textPrimary,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Switch(
-                        checked = manualHttpSteps,
-                        onCheckedChange = {
-                            manualHttpSteps = it
-                            puffinExperiment.manualHttpSteps = it
-                        },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = Palette.surfaceBase,
-                            checkedTrackColor = Palette.accent,
-                            uncheckedThumbColor = Palette.textSecondary,
-                            uncheckedTrackColor = Palette.surfaceInset,
-                            uncheckedBorderColor = Palette.hairline,
-                        ),
-                        modifier = Modifier.semantics {
-                            contentDescription = uiString(R.string.settings_manual_http_steps_title)
-                        },
-                    )
-                }
-                Text(
-                    uiString(R.string.settings_manual_http_steps_desc),
-                    style = NoopType.caption,
-                    color = Palette.textTertiary,
-                )
-                // The token + URL only matter once the switch is on — showing them earlier would suggest
-                // the endpoint is already live when it isn't (the /steps route itself checks the same
-                // toggle, so this is display-only, never the actual gate).
-                if (manualHttpSteps) {
-                    val clipboard = LocalClipboardManager.current
-                    val exampleUrl = "http://<phone-ip>:${WorkoutHttpServer.PORT}/steps?date=YYYY-MM-DD&count=N&token=${puffinExperiment.manualHttpStepsToken}"
-                    SelectionContainer {
-                        Text(
-                            exampleUrl,
-                            style = NoopType.caption.copy(fontFamily = FontFamily.Monospace),
-                            color = Palette.textSecondary,
-                        )
-                    }
-                    NoopButton(
-                        text = uiString(R.string.settings_manual_http_steps_copy_url),
-                        kind = NoopButtonKind.Secondary,
-                        onClick = { clipboard.setText(AnnotatedString(exampleUrl)) },
-                    )
-                }
-
                 // --- #103/queue-11a: Blood Oxygen strap estimate — OFF by default. ---
                 // Device-conditional (see IntelligenceEngine.nightlySpo2CeilingMean / .nightlySpo2CandidateMean):
                 // a WHOOP 5/MG strap computes a nightly SpO₂ candidate at byte @82 of the V18Aux stream
@@ -3505,6 +3509,46 @@ fun SettingsScreen(
                     TextButton(onClick = { confirmingDeepDataDisable = false }) {
                         Text(
                             uiString(R.string.l10n_settings_screen_r22disable_confirm_cancel),
+                            color = Palette.textSecondary,
+                        )
+                    }
+                },
+            )
+        }
+
+        if (confirmingManualHttpTokenRegenerate) {
+            AlertDialog(
+                onDismissRequest = { confirmingManualHttpTokenRegenerate = false },
+                containerColor = Palette.surfaceOverlay,
+                title = {
+                    Text(
+                        uiString(R.string.settings_manual_http_steps_regenerate_confirm_title),
+                        style = NoopType.title2,
+                        color = Palette.textPrimary,
+                    )
+                },
+                text = {
+                    Text(
+                        uiString(R.string.settings_manual_http_steps_regenerate_confirm_body),
+                        style = NoopType.subhead,
+                        color = Palette.textSecondary,
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        confirmingManualHttpTokenRegenerate = false
+                        manualHttpStepsToken = puffinExperiment.regenerateManualHttpStepsToken()
+                    }) {
+                        Text(
+                            uiString(R.string.settings_manual_http_steps_regenerate_confirm_action),
+                            color = Palette.accent,
+                        )
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { confirmingManualHttpTokenRegenerate = false }) {
+                        Text(
+                            uiString(R.string.settings_manual_http_steps_regenerate_confirm_cancel),
                             color = Palette.textSecondary,
                         )
                     }

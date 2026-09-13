@@ -2737,4 +2737,11 @@
     <string name="settings_manual_http_steps_title">Passos manuais via HTTP</string>
     <string name="settings_manual_http_steps_desc">Permite que um dispositivo na sua WiFi (por exemplo, um Atalho do iPhone que lê a Saúde da Apple) envie a contagem de passos de um dia diretamente para a NOOP — uma solução alternativa para uma sincronização do Health Connect que não funciona, não um substituto. Só preenche um dia que nem a Saúde da Apple nem o Health Connect já cubram; uma sincronização real ganha sempre. Requer o token abaixo como parte do pedido. Desativado por predefinição.</string>
     <string name="settings_manual_http_steps_copy_url">Copiar URL de exemplo</string>
+    <string name="settings_manual_http_steps_card_blurb">Envia para a NOOP a contagem de passos de um dia a partir de outro dispositivo na sua WiFi.</string>
+    <string name="settings_manual_http_steps_copy_token">Copiar token</string>
+    <string name="settings_manual_http_steps_regenerate_token">Regenerar token</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_title">Regenerar o token?</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_body">Qualquer Atalho ou script que use o token atual deixará de funcionar até o atualizar com o novo.</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_action">Regenerar</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_cancel">Cancelar</string>
 </resources>

@@ -2744,4 +2744,11 @@
     <string name="settings_manual_http_steps_title">Pas manuels par HTTP</string>
     <string name="settings_manual_http_steps_desc">Permet à un appareil sur votre WiFi (par ex. un raccourci iPhone lisant Apple Santé) d’envoyer directement à NOOP le nombre de pas d’une journée — une solution de contournement pour une synchronisation Health Connect défaillante, pas un remplacement. Ne comble qu’un jour que ni Apple Santé ni Health Connect ne couvrent déjà ; une vraie synchronisation l’emporte toujours. Nécessite le jeton ci-dessous dans la requête. Désactivé par défaut.</string>
     <string name="settings_manual_http_steps_copy_url">Copier l’URL d’exemple</string>
+    <string name="settings_manual_http_steps_card_blurb">Envoie à NOOP le nombre de pas d’une journée depuis un autre appareil sur votre WiFi.</string>
+    <string name="settings_manual_http_steps_copy_token">Copier le jeton</string>
+    <string name="settings_manual_http_steps_regenerate_token">Régénérer le jeton</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_title">Régénérer le jeton ?</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_body">Tout raccourci ou script utilisant le jeton actuel cessera de fonctionner tant que vous ne l’aurez pas mis à jour avec le nouveau.</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_action">Régénérer</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_cancel">Annuler</string>
 </resources>

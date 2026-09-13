@@ -270,24 +270,47 @@ class PuffinExperiment(private val prefs: SharedPreferences) {
 
     /**
      * The shared-secret token `/steps` requires as a query param — generated once (a random 24-character
-     * alphanumeric string, ~142 bits of entropy) and persisted, so the SAME token survives app restarts
-     * and only needs copying into the Shortcut once. Not real authentication (the endpoint is still
-     * plain HTTP on the local network, matching every other route in `WorkoutHttpServer`) — just enough
-     * that a stray device on the same WiFi can't silently write bogus step counts into permanent health
-     * data without at least having copied this value out of Settings first.
+     * string over [MANUAL_HTTP_STEPS_TOKEN_ALPHABET], ~120 bits of entropy) and persisted, so the SAME
+     * token survives app restarts and only needs copying into the Shortcut once. Not real authentication
+     * (the endpoint is still plain HTTP on the local network, matching every other route in
+     * `WorkoutHttpServer`) — just enough that a stray device on the same WiFi can't silently write bogus
+     * step counts into permanent health data without at least having copied this value out of Settings
+     * first. [WorkoutHttpServer.handleSteps] compares it case-insensitively, so a user who reads/types it
+     * by hand (rather than using [regenerateManualHttpStepsToken]'s companion Copy button) can't fail the
+     * check purely on case.
      */
     val manualHttpStepsToken: String
         get() = prefs.getString(KEY_MANUAL_HTTP_STEPS_TOKEN, null) ?: generateManualHttpStepsToken()
 
+    /**
+     * Force a brand NEW token, overwriting whatever was there — for the Settings "Regenerate" action,
+     * when a user suspects their copy is wrong (e.g. a token generated before [MANUAL_HTTP_STEPS_TOKEN_ALPHABET]
+     * excluded lowercase i/o, which this repo shipped briefly and which are easy to misread as 1/0 in a
+     * photo of the screen). Whatever consumed the OLD token (an already-configured Shortcut) will need
+     * updating — this is a deliberate, user-initiated action, never called automatically.
+     */
+    fun regenerateManualHttpStepsToken(): String = generateManualHttpStepsToken()
+
     private fun generateManualHttpStepsToken(): String {
-        val alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
-        val token = (1..24).map { alphabet[SECURE_RANDOM.nextInt(alphabet.length)] }.joinToString("")
+        val token = (1..24)
+            .map { MANUAL_HTTP_STEPS_TOKEN_ALPHABET[SECURE_RANDOM.nextInt(MANUAL_HTTP_STEPS_TOKEN_ALPHABET.length)] }
+            .joinToString("")
         prefs.edit().putString(KEY_MANUAL_HTTP_STEPS_TOKEN, token).apply()
         return token
     }
 
     companion object {
         private val SECURE_RANDOM = java.security.SecureRandom()
+
+        /** Uppercase-only, digits 2-9 only: excludes every character with a visually similar sibling
+         *  elsewhere in the set (I/O look like 1/0; a mixed-case alphabet would ALSO put lowercase i/o
+         *  back in play, which is what the original version of this token got wrong — it excluded
+         *  uppercase I/O and digits 0/1 but still generated lowercase i/o, an inconsistent set that is
+         *  genuinely easy to misread from a photo of the screen despite "looking right" to the reader).
+         *  32 symbols, so 24 characters is 5 bits/char x 24 = 120 bits of entropy — no meaningfully
+         *  weaker than the mixed-case set it replaces. */
+        internal const val MANUAL_HTTP_STEPS_TOKEN_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
         /** Persisted preferences file. Internal so a UI screen can observe external writes to it. */
         internal const val PREFS = "noop_experiments"
 

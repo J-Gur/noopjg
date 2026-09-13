@@ -107,7 +107,11 @@ class WorkoutHttpServer(port: Int = PORT) : NanoHTTPD(port) {
             )
         }
         val token = session.parms["token"].orEmpty()
-        if (token.isEmpty() || token != puffin.manualHttpStepsToken) {
+        // Case-insensitive: the token alphabet is uppercase-only (see PuffinExperiment's doc), but a
+        // user reading/typing it by hand may still enter lowercase out of habit. This is not real
+        // authentication (see the class doc), so relaxing case costs nothing meaningful and removes a
+        // whole class of "visually matches but doesn't compare equal" transcription failures.
+        if (token.isEmpty() || !token.equals(puffin.manualHttpStepsToken, ignoreCase = true)) {
             return textResponse(Response.Status.FORBIDDEN, "Invalid or missing token.")
         }
         val dateParam = session.parms["date"] ?: LocalDate.now().toString()

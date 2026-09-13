@@ -2758,4 +2758,11 @@
     <string name="settings_manual_http_steps_title">Manuelle Schritte per HTTP</string>
     <string name="settings_manual_http_steps_desc">Lässt ein Gerät in deinem WLAN (z. B. eine iPhone-Kurzbefehl-Aktion, die Apple Health ausliest) eine Tagesschrittzahl direkt an NOOP senden – ein Workaround für eine nicht funktionierende Health-Connect-Synchronisierung, kein Ersatz dafür. Füllt nur einen Tag auf, den weder Apple Health noch Health Connect bereits abdecken; eine echte Synchronisierung gewinnt immer. Erfordert das Token unten als Teil der Anfrage. Standardmäßig aus.</string>
     <string name="settings_manual_http_steps_copy_url">Beispiel-URL kopieren</string>
+    <string name="settings_manual_http_steps_card_blurb">Sendet die Schrittzahl eines Tages von einem anderen Gerät in deinem WLAN an NOOP.</string>
+    <string name="settings_manual_http_steps_copy_token">Token kopieren</string>
+    <string name="settings_manual_http_steps_regenerate_token">Token neu erzeugen</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_title">Token neu erzeugen?</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_body">Jeder Kurzbefehl oder jedes Skript, das das aktuelle Token verwendet, funktioniert erst wieder, wenn du es mit dem neuen Token aktualisierst.</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_action">Neu erzeugen</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_cancel">Abbrechen</string>
 </resources>

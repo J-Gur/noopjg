@@ -2774,4 +2774,11 @@
     <string name="settings_manual_http_steps_title">Manual steps via HTTP</string>
     <string name="settings_manual_http_steps_desc">Lets a device on your WiFi (e.g. an iPhone Shortcut reading Apple Health) send a day\'s step count straight to NOOP — a workaround for a Health Connect sync that isn\'t working, not a replacement for it. Only fills in a day neither Apple Health nor Health Connect already covers; a real sync always wins. Requires the token below as part of the request. Off by default.</string>
     <string name="settings_manual_http_steps_copy_url">Copy example URL</string>
+    <string name="settings_manual_http_steps_card_blurb">Push a day\'s step count into NOOP from another device on your WiFi.</string>
+    <string name="settings_manual_http_steps_copy_token">Copy Token</string>
+    <string name="settings_manual_http_steps_regenerate_token">Regenerate Token</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_title">Regenerate token?</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_body">Any Shortcut or script using the current token will stop working until you update it with the new one.</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_action">Regenerate</string>
+    <string name="settings_manual_http_steps_regenerate_confirm_cancel">Cancel</string>
 </resources>
