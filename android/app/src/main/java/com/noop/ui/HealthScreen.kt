@@ -1740,7 +1740,7 @@ private fun TileSparkline(values: List<Double>, color: Color, modifier: Modifier
     }
 }
 
-private data class VitalDetailModel(
+internal data class VitalDetailModel(
     val key: String,
     val title: String,
     val unit: String,
@@ -2238,8 +2238,18 @@ private fun RecentDaySelectorBar(selectedOffset: Int, onSelect: (Int) -> Unit) {
     ThreeDaySelectorBar(selectedOffset = selectedOffset, onSelect = onSelect)
 }
 
-private fun buildVitalDetail(
-    days: List<DailyMetric>,
+/**
+ * The future-date guard, factored out as its own pure seam: [buildVitalDetail] itself resolves
+ * strings via [uiString]/`NoopApplication` and cannot run in a plain JVM test (the arrangement
+ * `SkinTempAbsoluteDisplayTest`/`Spo2MissingCaptionTest` already use for the same reason), so this is
+ * what a test actually exercises. A row dated AFTER [today] must never survive into "Latest" —
+ * mirrors the guard [lastScoredRecoveryDay]'s carry-over already applies on the Today tile.
+ */
+internal fun excludeFutureDatedRows(days: List<DailyMetric>, today: String): List<DailyMetric> =
+    days.filter { it.day <= today }
+
+internal fun buildVitalDetail(
+    allDays: List<DailyMetric>,
     key: String,
     tempUnit: TemperatureUnit,
     effortScale: EffortScale = EffortScale.HUNDRED,
@@ -2247,7 +2257,16 @@ private fun buildVitalDetail(
     // #1846: travels like tempUnit — read from prefs by the caller, never defaulted quietly here, so the
     // setting cannot look wired while doing nothing.
     skinTempPreferred: SkinTempDisplay.Kind = SkinTempDisplay.Kind.ABSOLUTE,
+    // Same guard the Today tile's carry-over (lastScoredRecoveryDay) already applies, now applied
+    // here too: a stray FUTURE-dated row (a bad clock during a backfill, or a "-noop" row keyed one day
+    // ahead of what the Today screen currently resolves as today) must never be picked as "Latest" —
+    // that's how the tile and this screen disagreed on the same underlying `days` list even though
+    // neither was stale (a fresh relaunch re-reads the same persisted rows and reproduces it). The
+    // default mirrors TodayScreen's own carryOverTodayKey: the LATER of the logical day (rolls at 04:00)
+    // and the local calendar day, so a legitimate post-midnight-pre-04:00 row is never wrongly excluded.
+    today: String = maxOf(logicalDayKeyNow(), java.time.LocalDate.now().toString()),
 ): VitalDetailModel? {
+    val days = excludeFutureDatedRows(allDays, today)
     return when (key) {
     // The Today Key-Metrics Recovery tile's drill-in: the Recovery (Charge) trend timeline, matching the
     // Sleep night-detail pattern. Today's DRIVERS stay on the hero ring's breakdown sheet; this is history.
