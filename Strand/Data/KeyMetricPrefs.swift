@@ -23,6 +23,11 @@ enum KeyMetric: String, CaseIterable, Identifiable {
     case restingHr
     case bloodOxygen
     case respiratory
+    // Steps and Calories moved to their own always-visible ActivitySummaryRow (right after Hero, next to
+    // the recovery ring) instead of living in this customizable grid. The cases stay here — never delete
+    // a KeyMetric case a saved layout string may still name — but they are deliberately absent from
+    // defaultOrder below AND excluded from the layout editor's offered list, so a stale saved token
+    // decodes harmlessly but a user can never re-add them to the grid. Mirrors Android KeyMetric.kt.
     case steps
     case weight
     case calories
@@ -54,9 +59,11 @@ enum KeyMetric: String, CaseIterable, Identifiable {
     }
 
     /// The original, hard-coded grid order — the default when the user hasn't customised the layout.
+    /// `.steps`/`.calories` are deliberately absent (see their doc): they render in their own
+    /// always-visible row next to Hero now, never in this grid.
     static let defaultOrder: [KeyMetric] = [
         .charge, .effort, .rest, .hrv, .restingHr,
-        .bloodOxygen, .respiratory, .steps, .weight, .calories,
+        .bloodOxygen, .respiratory, .weight,
     ]
 }
 

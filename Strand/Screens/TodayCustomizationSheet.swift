@@ -87,8 +87,14 @@ struct TodayCustomizationSheet: View {
             visible: fullSectionOrder.filter { !hiddenSectionSet.contains($0) },
             hidden: fullSectionOrder.filter { hiddenSectionSet.contains($0) }
         )
+        // .steps/.calories are excluded here even though a pre-existing saved layout string might still
+        // name them (decodeEnabled tolerates the stale tokens harmlessly, and the grid itself filters
+        // them at render time too) — without this filter a legacy install would see them listed as
+        // "shown" tiles that toggling does nothing visible for, since they now render in
+        // `activitySummaryRow` regardless of this editor's choice.
         let metrics = EditableLayoutDraft(
-            visible: KeyMetricPrefs.decodeEnabled(keyMetricsRaw.wrappedValue),
+            visible: KeyMetricPrefs.decodeEnabled(keyMetricsRaw.wrappedValue)
+                .filter { $0 != .steps && $0 != .calories },
             allItems: KeyMetric.defaultOrder
         )
         let cards = EditableLayoutDraft(

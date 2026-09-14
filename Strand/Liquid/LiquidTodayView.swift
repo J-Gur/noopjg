@@ -331,7 +331,14 @@ struct LiquidTodayView: View {
                     // nothing and keeps its slot in the saved order.
                     ForEach(sectionOrder) { section in
                         switch section {
-                        case .hero: heroCard
+                        // Steps + Calories render right after Hero, next to the recovery ring, always —
+                        // not a reorderable/hideable section of their own, the same way this always
+                        // travels with whatever slot the user drags Hero to. See `activitySummaryRow`.
+                        case .hero:
+                            VStack(alignment: .leading, spacing: 12) {
+                                heroCard
+                                activitySummaryRow
+                            }
                         case .liveSession: if liveSessionsBeta { liveSessionStartRow }
                         case .synthesis: synthesisSection
                         case .keyMetrics: keyMetricsSection
@@ -1262,7 +1269,12 @@ struct LiquidTodayView: View {
                 ),
                 spacing: NoopMetrics.gap
             ) {
-                ForEach(enabledKeyMetrics) { metric in
+                // .steps/.calories are filtered defensively even though defaultOrder no longer includes
+                // them — a pre-existing saved layout string could still name them, and `ktileFor` still
+                // has working cases for both (kept so a stale token decodes harmlessly, per KeyMetric's
+                // own doc), which would otherwise render them a second time here alongside
+                // `activitySummaryRow`.
+                ForEach(enabledKeyMetrics.filter { $0 != .steps && $0 != .calories }) { metric in
                     ktileFor(metric, hrv: hrv, rhr: rhr)
                 }
             }
@@ -1270,6 +1282,19 @@ struct LiquidTodayView: View {
                 LiquidFullWidthNavigationAction("Show all metrics")
             }
             .buttonStyle(LiquidPressStyle())
+        }
+    }
+
+    /// Steps + Calories, pulled out of the customizable Key Metrics grid into their own always-visible,
+    /// prominent row placed right after Hero (next to the recovery ring) — distinct from the reorderable/
+    /// hideable Key Metrics section rather than two cells among many inside it. Reuses `ktileFor`
+    /// verbatim (`hrv`/`rhr` are unused by the `.steps`/`.calories` cases), so the data plumbing is
+    /// byte-identical to what the grid showed — only the placement changed. Mirrors Android
+    /// `ActivitySummaryRow` (TodayScreen.kt).
+    private var activitySummaryRow: some View {
+        HStack(spacing: NoopMetrics.gap) {
+            ktileFor(.steps, hrv: nil, rhr: nil)
+            ktileFor(.calories, hrv: nil, rhr: nil)
         }
     }
 

@@ -1544,6 +1544,23 @@ fun TodayScreen(
                                     )
                                 }
                             }
+                            // Steps + Calories: a dedicated, always-visible row right after the recovery
+                            // ring — pulled out of the customizable Key Metrics grid below so these two
+                            // read as a clearly separate, prominent section rather than two cells among
+                            // many. Not a TodaySection itself; it always travels with Hero. Same real
+                            // data plumbing MetricGrid uses (see ActivitySummaryRow's doc).
+                            ActivitySummaryRow(
+                                d = stepResolvedDisplayMetric,
+                                importedStepsForDay = importedStepsForDay,
+                                estimatedStepsForDay = stepsEstForDay,
+                                stepsSpark = window.steps,
+                                stepsEstimateCaption = stepsEstimateCaption(profileStore),
+                                stepsCalibrationPrompt = stepsCalibrationPrompt(context, profileStore),
+                                caloriesForDay = caloriesByDay[selectedDayKey],
+                                caloriesSpark = caloriesSpark,
+                                onOpenMetric = onOpenMetric,
+                                onOpenStepsCalibration = onOpenStepsCalibration,
+                            )
                         }
                         // LIVE SESSIONS (beta): the compact "Start session · BETA" entry. Today only
                         // (offset 0 — a session is a now-thing), gated on the Settings beta flag; a RUNNING
@@ -5362,25 +5379,10 @@ private fun MetricGrid(
                 spark = w.resp,
             )
         },
-        KeyMetric.STEPS to run {
-            // Steps precedence (unchanged): on-device count → imported → estimate. (#107/#150)
-            val steps = realStepsForDay ?: estimatedStepsForDay
-            KeyTileData(
-                label = uiString(R.string.l10n_today_screen_steps_cdde4f20),
-                value = steps?.let { intString(it.toDouble()) } ?: NO_DATA,
-                unit = "",
-                tint = Palette.metricCyan,
-                frac = steps?.let { (it / 10000.0).coerceIn(0.0, 1.0) },
-                spark = w.steps,   // #616: was missing → no trend line under the tile
-                // A measured count needs no explanation; an ESTIMATE says what it was fitted from
-                // (#760/#792); a BLANK tile on a strap that estimates says what would unblock it (#1491).
-                caption = when {
-                    realStepsForDay != null -> null
-                    estimatedStepsForDay != null -> stepsEstimateCaption
-                    else -> stepsCalibrationPrompt
-                },
-            )
-        },
+        // STEPS and CALORIES are deliberately absent here: they moved into their own always-visible
+        // ActivitySummaryRow (placed right after Hero, next to the recovery ring) instead of living in
+        // the customizable grid — see ActivitySummaryRow's doc. stepsKeyTileData/caloriesKeyTileData
+        // carry the exact same precedence/data logic this map used to inline for them.
         KeyMetric.WEIGHT to run {
             val weight = weightTile(latestWeightKg, profileWeightKg, unitSystem)
             KeyTileData(
@@ -5389,19 +5391,6 @@ private fun MetricGrid(
                 unit = "",
                 tint = Palette.accent,
                 frac = null,
-            )
-        },
-        KeyMetric.CALORIES to run {
-            // #616: the per-day resolved calorie value (caloriesForDay = imported Apple/Health-Connect
-            // first, else NOOP's on-device estimate) — one number across tile, card and detail.
-            val kcal = caloriesForDay
-            KeyTileData(
-                label = uiString(R.string.l10n_today_screen_calories_3e62ecfe),
-                value = kcal?.let { intString(it) } ?: NO_DATA,
-                unit = if (kcal != null) "kcal" else "",
-                tint = Palette.metricAmber,
-                frac = kcal?.let { (it / 800.0).coerceIn(0.0, 1.0) },
-                spark = caloriesSpark,   // #616: imported-first trend (was missing → no trend line)
             )
         },
         KeyMetric.SKIN_TEMP to run {
@@ -5476,10 +5465,9 @@ private fun MetricGrid(
                         windowDays = windowDays,
                         onClick = tapFor(metric),
                         modifier = Modifier.weight(1f).then(if (detailed) Modifier.fillMaxHeight() else Modifier),
-                        // Steps/Calories get the size/prominence bump (see LiquidKeyTile's `prominent`
-                        // doc) — same grid slot, same reorder/hide behavior, just a bigger number and a
-                        // tinted card so they read as more important than a plain vital readout.
-                        prominent = metric == KeyMetric.STEPS || metric == KeyMetric.CALORIES,
+                        // Steps/Calories used to get a prominence bump here; they now live in their own
+                        // ActivitySummaryRow instead (see its doc) and can never appear in this grid, so
+                        // every tile here is the plain (non-prominent) size.
                     )
                 }
                 repeat(3 - rowTiles.size) { Spacer(Modifier.weight(1f)) }
@@ -5552,6 +5540,97 @@ private fun keyMetricIcon(metric: KeyMetric): ImageVector = when (metric) {
     KeyMetric.CALORIES -> Icons.Filled.LocalFireDepartment
     // Same glyph the sibling "Your Cards" tile (DashboardCard.SKIN_TEMP) already uses.
     KeyMetric.SKIN_TEMP -> Icons.Filled.Thermostat
+}
+
+/** Builds the Steps tile's [KeyTileData] — the exact precedence/caption logic the Key Metrics grid used
+ *  to inline, now shared between [MetricGrid] (which no longer renders Steps) and [ActivitySummaryRow]
+ *  (which does). Steps precedence: on-device count → imported → estimate. (#107/#150) */
+private fun stepsKeyTileData(
+    realStepsForDay: Int?,
+    estimatedStepsForDay: Int?,
+    spark: List<Double>,
+    stepsEstimateCaption: String,
+    stepsCalibrationPrompt: String?,
+): KeyTileData {
+    val steps = realStepsForDay ?: estimatedStepsForDay
+    return KeyTileData(
+        label = uiString(R.string.l10n_today_screen_steps_cdde4f20),
+        value = steps?.let { intString(it.toDouble()) } ?: NO_DATA,
+        unit = "",
+        tint = Palette.metricCyan,
+        frac = steps?.let { (it / 10000.0).coerceIn(0.0, 1.0) },
+        spark = spark,   // #616: was missing → no trend line under the tile
+        // A measured count needs no explanation; an ESTIMATE says what it was fitted from (#760/#792);
+        // a BLANK tile on a strap that estimates says what would unblock it (#1491).
+        caption = when {
+            realStepsForDay != null -> null
+            estimatedStepsForDay != null -> stepsEstimateCaption
+            else -> stepsCalibrationPrompt
+        },
+    )
+}
+
+/** Builds the Calories tile's [KeyTileData] — the exact resolution logic the Key Metrics grid used to
+ *  inline, now shared between [MetricGrid] (which no longer renders Calories) and [ActivitySummaryRow]
+ *  (which does). #616: [caloriesForDay] is the per-day resolved value — imported Apple/Health-Connect
+ *  first, else NOOP's on-device estimate — one number across tile, card and detail. */
+private fun caloriesKeyTileData(caloriesForDay: Double?, spark: List<Double>): KeyTileData = KeyTileData(
+    label = uiString(R.string.l10n_today_screen_calories_3e62ecfe),
+    value = caloriesForDay?.let { intString(it) } ?: NO_DATA,
+    unit = if (caloriesForDay != null) "kcal" else "",
+    tint = Palette.metricAmber,
+    frac = caloriesForDay?.let { (it / 800.0).coerceIn(0.0, 1.0) },
+    spark = spark,   // #616: imported-first trend (was missing → no trend line)
+)
+
+/**
+ * Steps + Calories, pulled out of the customizable Key Metrics grid into their own always-visible,
+ * prominent row placed right after Hero (next to the recovery ring) — distinct from the reorderable/
+ * hideable Key Metrics section rather than two cells among many inside it. NOT a [TodaySection]: it
+ * isn't independently draggable or hideable, it simply always travels with Hero, the same way the
+ * "why is Effort 0?" caption already does. Reuses [stepsKeyTileData]/[caloriesKeyTileData] and
+ * [LiquidKeyTile] verbatim, so the data plumbing (precedence, estimates, captions) is byte-identical to
+ * what the grid showed — only the placement and always-prominent sizing changed.
+ */
+@Composable
+private fun ActivitySummaryRow(
+    d: DailyMetric?,
+    importedStepsForDay: Int?,
+    estimatedStepsForDay: Int?,
+    stepsSpark: List<Double>,
+    stepsEstimateCaption: String,
+    stepsCalibrationPrompt: String?,
+    caloriesForDay: Double?,
+    caloriesSpark: List<Double>,
+    onOpenMetric: (String) -> Unit,
+    onOpenStepsCalibration: () -> Unit,
+) {
+    val realStepsForDay = d?.steps ?: importedStepsForDay
+    val stepsOpenCalibration = stepsTileShouldOpenCalibration(
+        realSteps = realStepsForDay,
+        estimatedSteps = estimatedStepsForDay,
+        calibrationPrompt = stepsCalibrationPrompt,
+    )
+    val stepsTile = stepsKeyTileData(
+        realStepsForDay, estimatedStepsForDay, stepsSpark, stepsEstimateCaption, stepsCalibrationPrompt,
+    )
+    val caloriesTile = caloriesKeyTileData(caloriesForDay, caloriesSpark)
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        LiquidKeyTile(
+            stepsTile,
+            icon = keyMetricIcon(KeyMetric.STEPS),
+            onClick = if (stepsOpenCalibration) onOpenStepsCalibration else ({ onOpenMetric("steps_est") }),
+            modifier = Modifier.weight(1f),
+            prominent = true,
+        )
+        LiquidKeyTile(
+            caloriesTile,
+            icon = keyMetricIcon(KeyMetric.CALORIES),
+            onClick = { onOpenMetric("active_kcal") },
+            modifier = Modifier.weight(1f),
+            prominent = true,
+        )
+    }
 }
 
 /**
@@ -7285,7 +7364,16 @@ private fun KeyMetricsEditorDialog(
     // chosen trailing window (1 week / 2 weeks / 1 month).
     var detailed by remember { mutableStateOf(initialDetailed) }
     var windowDays by remember { mutableStateOf(initialWindowDays) }
-    val shown = remember { mutableStateListOf<KeyMetric>().apply { addAll(initial) } }
+    // Steps/Calories are excluded here even though a pre-existing saved layout string might still name
+    // them (decodeEnabled tolerates the stale tokens harmlessly, and the grid itself no longer has
+    // descriptors for them either) — without this filter a legacy install would see them listed as
+    // "shown" tiles that toggling does nothing visible for, since they now render in ActivitySummaryRow
+    // regardless of this editor's choice.
+    val shown = remember {
+        mutableStateListOf<KeyMetric>().apply {
+            addAll(initial.filter { it != KeyMetric.STEPS && it != KeyMetric.CALORIES })
+        }
+    }
     val hidden = remember {
         mutableStateListOf<KeyMetric>().apply {
             addAll(KeyMetric.defaultOrder.filter { it !in initial })

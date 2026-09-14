@@ -28,6 +28,11 @@ enum class KeyMetric(val raw: String, @StringRes val titleRes: Int) {
     RESTING_HR("restingHr", R.string.today_metric_resting_hr),
     BLOOD_OXYGEN("bloodOxygen", R.string.today_metric_blood_oxygen),
     RESPIRATORY("respiratory", R.string.today_metric_respiratory),
+    // Steps and Calories moved to their own always-visible ActivitySummaryRow (TodayScreen.kt, right
+    // after Hero) instead of living in this customizable grid. The cases stay here — never delete a
+    // KeyMetric case a saved layout string may still name (see the enum's own doc) — but they are
+    // deliberately absent from defaultOrder below AND excluded from KeyMetricsEditorDialog's offered
+    // list, so a stale saved token can be decoded harmlessly but a user can never re-add them to the grid.
     STEPS("steps", R.string.today_metric_steps),
     WEIGHT("weight", R.string.today_metric_weight),
     CALORIES("calories", R.string.today_metric_calories),
@@ -41,10 +46,12 @@ enum class KeyMetric(val raw: String, @StringRes val titleRes: Int) {
     companion object {
         fun fromRaw(raw: String?): KeyMetric? = entries.firstOrNull { it.raw == raw }
 
-        /** The original, hard-coded grid order — the default when the layout isn't customised. */
+        /** The original, hard-coded grid order — the default when the layout isn't customised. STEPS and
+         *  CALORIES are deliberately absent (see their doc): they render in their own always-visible row
+         *  next to Hero now, never in this grid. */
         val defaultOrder: List<KeyMetric> = listOf(
             CHARGE, EFFORT, REST, HRV, RESTING_HR,
-            BLOOD_OXYGEN, RESPIRATORY, STEPS, WEIGHT, CALORIES,
+            BLOOD_OXYGEN, RESPIRATORY, WEIGHT,
         )
     }
 }
