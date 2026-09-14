@@ -188,6 +188,10 @@ object WorkoutEditing {
      * Of two same-activity rows, the one to KEEP. Prefer the richer (more captured signals); on a tie
      * prefer the strap-native source (live/manual/detected/whoop carry the real trace) over a thin
      * import (Apple Health / Health Connect); final tie -> the longer session, then [a] (stable).
+     *
+     * Returns one of [a]/[b] BY REFERENCE, never a copy — [collapseCrossSource]'s trace path relies on
+     * that (`winner === kept[idx]`) to attribute which side won. [blend] is the function that produces
+     * the enriched row actually kept/displayed; this one only decides identity.
      */
     fun preferred(a: WorkoutRow, b: WorkoutRow): WorkoutRow {
         val ra = richness(a)
@@ -200,6 +204,35 @@ object WorkoutEditing {
         val db = b.endTs - b.startTs
         if (da != db) return if (da > db) a else b
         return a
+    }
+
+    /**
+     * The row actually kept for a same-activity pair: [preferred]'s winner, enriched with any of the
+     * loser's fields the winner itself lacks. A live WHOOP session and its Health-Connect-imported
+     * twin (e.g. Strava via HC) commonly carry DISJOINT signals — HR/strain/zones from the strap,
+     * distance/energy/route from the import — and [preferred] alone picks one row wholesale, silently
+     * dropping the other's unique data. This keeps the winner's IDENTITY untouched (deviceId/startTs/
+     * sport/source), so every downstream consumer that treats the result as "a real row at this PK"
+     * (edit, delete, "duplicate as manual", detail view) still works exactly as before — the borrowed
+     * fields are display-only enrichment, never persisted back to either original row.
+     *
+     * Only fills a field the winner is missing; never overwrites one the winner already has, so this
+     * can never make a rich strap session look OK for the wrong reason. Mirrors the [richness] field
+     * set, plus distance/energy/route (kcal/distance count toward richness but a zero winner value
+     * still means "no signal" here, same as [richness]'s own `> 0.0` gate).
+     */
+    fun blend(a: WorkoutRow, b: WorkoutRow): WorkoutRow {
+        val winner = preferred(a, b)
+        val loser = if (winner === a) b else a
+        return winner.copy(
+            avgHr = winner.avgHr ?: loser.avgHr,
+            maxHr = winner.maxHr ?: loser.maxHr,
+            strain = winner.strain ?: loser.strain,
+            zonesJSON = winner.zonesJSON.takeUnless { it.isNullOrEmpty() } ?: loser.zonesJSON,
+            distanceM = winner.distanceM.takeUnless { (it ?: 0.0) <= 0.0 } ?: loser.distanceM,
+            energyKcal = winner.energyKcal.takeUnless { (it ?: 0.0) <= 0.0 } ?: loser.energyKcal,
+            routePolyline = winner.routePolyline.takeUnless { it.isNullOrEmpty() } ?: loser.routePolyline,
+        )
     }
 
     // MARK: - Detected-vs-real overlap collapse (#975)
@@ -253,7 +286,9 @@ object WorkoutEditing {
      * ONCE per row (not twice per comparison), rows are bucketed by it, and a candidate only ever compares
      * against kept rows of the SAME sport (a cross-sport pair can never be [sameActivity]). That removes the
      * per-comparison string-normalisation that made a large imported history freeze the workout screens.
-     * [onMerge] is invoked with (winner, loser) for each collapsed pair so the trace path can record it.
+     * [onMerge] is invoked with (winner, loser) for each collapsed pair so the trace path can record it —
+     * [preferred]'s reference-identity result, NOT the [blend]ed row actually stored in `kept`, so the
+     * winner/loser attribution can never be thrown off by blend() returning a freshly-copied row.
      */
     private fun collapseCrossSource(
         input: List<WorkoutRow>,
@@ -269,7 +304,7 @@ object WorkoutEditing {
                 if (overlapsInTime(kept[idx], row)) { // same sport guaranteed by the bucket
                     val winner = preferred(kept[idx], row)
                     if (onMerge != null) onMerge(winner, if (winner === kept[idx]) row else kept[idx])
-                    kept[idx] = winner
+                    kept[idx] = blend(kept[idx], row)
                     merged = true
                     break
                 }

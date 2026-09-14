@@ -201,6 +201,119 @@ class WorkoutEditingTest {
         assertEquals("Strength Training", out[1].sport)
     }
 
+    // MARK: - blend (Strava/HC field-level merge)
+
+    @Test
+    fun blend_combinesDisjointFieldsKeepingWinnerIdentity() {
+        // WHOOP: HR/strain/zones captured, but no distance/route (indoor, no GPS attached).
+        val whoop = WorkoutRow(
+            deviceId = "my-whoop", startTs = 1000, endTs = 4600, sport = "Running", source = "whoop",
+            durationS = 3600.0, energyKcal = null, avgHr = 150, maxHr = 178, strain = 14.0,
+            zonesJSON = "{\"z1\":10}",
+        )
+        // Health Connect (e.g. Strava): distance/energy/route, no HR/strain/zones.
+        val hc = WorkoutRow(
+            deviceId = "health-connect", startTs = 1030, endTs = 4580, sport = "Running", source = "health-connect",
+            durationS = 3550.0, energyKcal = 590.0, distanceM = 8_200.0, routePolyline = "abc123",
+        )
+        val blended = WorkoutEditing.blend(whoop, hc)
+        // Identity stays the winner's (WHOOP is richer: 3 signals vs HC's 2).
+        assertEquals("my-whoop", blended.deviceId)
+        assertEquals(1000L, blended.startTs)
+        assertEquals("whoop", blended.source)
+        // WHOOP's own fields are untouched.
+        assertEquals(150, blended.avgHr)
+        assertEquals(178, blended.maxHr)
+        assertEquals(14.0, blended.strain!!, 1e-9)
+        assertEquals("{\"z1\":10}", blended.zonesJSON)
+        // HC's UNIQUE fields are borrowed in, not discarded.
+        assertEquals(8_200.0, blended.distanceM!!, 1e-9)
+        assertEquals(590.0, blended.energyKcal!!, 1e-9)
+        assertEquals("abc123", blended.routePolyline)
+        // Neither original row is mutated.
+        assertNull(whoop.distanceM)
+        assertNull(hc.avgHr)
+    }
+
+    @Test
+    fun blend_neverOverwritesAFieldTheWinnerAlreadyHas() {
+        // Both rows carry distance; the winner's own (larger, presumably more-authoritative-for-a-strap)
+        // value must survive, never be replaced by the loser's.
+        val whoop = richRow(1000, 4600, "Running", "whoop").copy(distanceM = 10_000.0)
+        val hc = thinImport(1030, 4580, "Running", "health-connect").copy(distanceM = 8_200.0)
+        val blended = WorkoutEditing.blend(whoop, hc)
+        assertEquals(10_000.0, blended.distanceM!!, 1e-9)
+    }
+
+    @Test
+    fun blend_isNoOpWhenTheWinnerAlreadyHasEverything() {
+        // A rich single-source row paired with a thinner row of the SAME source has nothing to borrow —
+        // blend must equal the winner exactly, byte for byte.
+        val a = richRow(1000, 4600, "Running", "whoop")
+        val b = thinImport(1030, 4580, "Running", "whoop")
+        assertEquals(a, WorkoutEditing.blend(a, b))
+    }
+
+    @Test
+    fun blend_bothThin_stillCombinesTheirDisjointFields() {
+        // Two thin rows, each missing what the other has (a distance-only import and an energy-only
+        // import) — the "same-source no-op" case above is the OTHER extreme; this is the general case
+        // blend exists for.
+        val distanceOnly = WorkoutRow(
+            deviceId = "health-connect", startTs = 1000, endTs = 4600, sport = "Running",
+            source = "health-connect", durationS = 3600.0, distanceM = 5_000.0,
+        )
+        val energyOnly = WorkoutRow(
+            deviceId = "apple-health", startTs = 1020, endTs = 4580, sport = "Running",
+            source = "apple-health", durationS = 3560.0, energyKcal = 400.0,
+        )
+        val blended = WorkoutEditing.blend(distanceOnly, energyOnly)
+        assertEquals(5_000.0, blended.distanceM!!, 1e-9)
+        assertEquals(400.0, blended.energyKcal!!, 1e-9)
+    }
+
+    @Test
+    fun dedupCrossSource_keepsBothSourcesUniqueFieldsInTheDisplayedRow() {
+        // End-to-end: the public dedup entry point must show the blend, not the bare preferred() pick.
+        val whoop = WorkoutRow(
+            deviceId = "my-whoop", startTs = 1000, endTs = 4600, sport = "Running", source = "whoop",
+            durationS = 3600.0, avgHr = 150, maxHr = 178, strain = 14.0,
+        )
+        val strava = WorkoutRow(
+            deviceId = "health-connect", startTs = 1030, endTs = 4580, sport = "Running",
+            source = "health-connect", durationS = 3550.0, distanceM = 8_200.0, routePolyline = "poly",
+        )
+        val out = WorkoutEditing.dedupCrossSource(listOf(whoop, strava))
+        assertEquals(1, out.size)
+        val kept = out.first()
+        assertEquals("whoop", kept.source)          // identity: the richer, strap-native row
+        assertEquals(14.0, kept.strain!!, 1e-9)      // WHOOP's own signal
+        assertEquals(8_200.0, kept.distanceM!!, 1e-9) // borrowed from Strava/HC
+        assertEquals("poly", kept.routePolyline)      // borrowed from Strava/HC
+    }
+
+    @Test
+    fun dedupCrossSourceTrace_attributionUnaffectedByBlending() {
+        // The trace must still name the TRUE preferred() winner/loser even though the row it displays is
+        // now an enriched blend — a regression this exact change could introduce if blend()'s output were
+        // used for the reference-identity check instead of preferred()'s.
+        val whoop = WorkoutRow(
+            deviceId = "my-whoop", startTs = 1000, endTs = 4600, sport = "Running", source = "whoop",
+            durationS = 3600.0, avgHr = 150, maxHr = 178, strain = 14.0,
+        )
+        val strava = WorkoutRow(
+            deviceId = "health-connect", startTs = 1030, endTs = 4580, sport = "Running",
+            source = "health-connect", durationS = 3550.0, distanceM = 8_200.0,
+        )
+        val (kept, trace) = WorkoutEditing.dedupCrossSourceTrace(listOf(whoop, strava))
+        assertEquals(1, kept.size)
+        assertEquals(1, trace.size)
+        assertTrue(trace[0], trace[0].contains("kept=strap"))
+        assertTrue(trace[0], trace[0].contains("dropped=apple"))
+        // The displayed row is still the enriched blend, not a bare preferred() pick.
+        assertEquals(8_200.0, kept.first().distanceM!!, 1e-9)
+    }
+
     // MARK: - detected-vs-real overlap collapse (#975)
 
     @Test
@@ -596,14 +709,17 @@ class WorkoutEditingTest {
 
     // MARK: - dedup perf refactor: bucketed collapse == naive walk (byte-identical)
 
-    /** The ORIGINAL O(n²) collapse, kept here verbatim as the oracle the bucketed version must match. */
+    /** The ORIGINAL O(n²) collapse, kept here verbatim as the oracle the bucketed version must match.
+     *  Uses [WorkoutEditing.blend] (not bare [WorkoutEditing.preferred]) since that is what the real
+     *  [WorkoutEditing.dedupCrossSource] now stores per collapse — this oracle must track that change or
+     *  it stops being a valid comparison, not because the perf refactor itself changed. */
     private fun naiveDedupCrossSource(rows: List<WorkoutRow>): List<WorkoutRow> {
         val input = WorkoutEditing.dropDetectedShadows(rows)
         val kept = ArrayList<WorkoutRow>(input.size)
         outer@ for (row in input) {
             for (i in kept.indices) {
                 if (WorkoutEditing.sameActivity(kept[i], row)) {
-                    kept[i] = WorkoutEditing.preferred(kept[i], row)
+                    kept[i] = WorkoutEditing.blend(kept[i], row)
                     continue@outer
                 }
             }
@@ -614,7 +730,7 @@ class WorkoutEditingTest {
 
     /**
      * The bucketed [WorkoutEditing.dedupCrossSource] must be BYTE-IDENTICAL to the naive walk it replaced —
-     * same kept set, same order, same [WorkoutEditing.preferred] winner per collapse — over thousands of
+     * same kept set, same order, same [WorkoutEditing.blend] result per collapse — over thousands of
      * randomised inputs. Sport strings include case/space variants that fold to the same sportKey (so the
      * bucket key is exercised) and detected/real mixes (so dropDetectedShadows runs). This is what lets the
      * O(n²)->near-linear change ship without a device: correctness is proven against the old behaviour.

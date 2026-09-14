@@ -171,6 +171,86 @@ final class WorkoutSourceTests: XCTestCase {
         XCTAssertEqual(out[1].sport, "Strength Training")
     }
 
+    // MARK: - blend (Strava/HC field-level merge)
+
+    func testBlendCombinesDisjointFieldsKeepingWinnerIdentity() {
+        // WHOOP: HR/strain/zones captured, but no distance/route (indoor, no GPS attached).
+        let whoop = WorkoutRow(startTs: 1000, endTs: 4600, sport: "Running", source: "whoop",
+                                durationS: 3600, energyKcal: nil, avgHr: 150, maxHr: 178,
+                                strain: 14.0, distanceM: nil, zonesJSON: #"{"z1":10}"#, notes: nil, steps: nil)
+        // Health Connect (e.g. Strava): distance/energy, no HR/strain/zones.
+        let hc = WorkoutRow(startTs: 1030, endTs: 4580, sport: "Running", source: "health-connect",
+                             durationS: 3550, energyKcal: 590, avgHr: nil, maxHr: nil,
+                             strain: nil, distanceM: 8_200, zonesJSON: nil, notes: nil, steps: nil)
+        let blended = WorkoutSource.blend(whoop, hc)
+        // Identity stays the winner's (WHOOP is richer: 3 signals vs HC's 2).
+        XCTAssertEqual(blended.startTs, 1000)
+        XCTAssertEqual(blended.source, "whoop")
+        // WHOOP's own fields are untouched.
+        XCTAssertEqual(blended.avgHr, 150)
+        XCTAssertEqual(blended.maxHr, 178)
+        XCTAssertEqual(blended.strain, 14.0)
+        XCTAssertEqual(blended.zonesJSON, #"{"z1":10}"#)
+        // HC's UNIQUE fields are borrowed in, not discarded.
+        XCTAssertEqual(blended.distanceM, 8_200)
+        XCTAssertEqual(blended.energyKcal, 590)
+        // Neither original row is mutated (WorkoutRow is a value type, but assert the intent explicitly).
+        XCTAssertNil(whoop.distanceM)
+        XCTAssertNil(hc.avgHr)
+    }
+
+    func testBlendNeverOverwritesAFieldTheWinnerAlreadyHas() {
+        // Both rows carry distance; the winner's own value must survive, never replaced by the loser's.
+        let whoop = richRow(start: 1000, end: 4600, sport: "Running", source: "whoop")   // distanceM: 10_000
+        let hcWithDistance = WorkoutRow(startTs: 1030, endTs: 4580, sport: "Running", source: "health-connect",
+                                         durationS: 3550, energyKcal: 590, avgHr: nil, maxHr: nil,
+                                         strain: nil, distanceM: 8_200, zonesJSON: nil, notes: nil, steps: nil)
+        XCTAssertEqual(WorkoutSource.blend(whoop, hcWithDistance).distanceM, 10_000)
+    }
+
+    func testBlendIsNoOpWhenTheWinnerAlreadyHasEverything() {
+        // A rich single-source row paired with a thinner row of the SAME source has nothing to borrow —
+        // blend must equal the winner exactly.
+        let a = richRow(start: 1000, end: 4600, sport: "Running", source: "whoop")
+        let b = thinImport(start: 1030, end: 4580, sport: "Running", source: "whoop")
+        XCTAssertEqual(WorkoutSource.blend(a, b), a)
+    }
+
+    func testDedupKeepsBothSourcesUniqueFieldsInTheDisplayedRow() {
+        // End-to-end: the public dedup entry point must show the blend, not the bare preferred() pick.
+        let whoop = WorkoutRow(startTs: 1000, endTs: 4600, sport: "Running", source: "whoop",
+                                durationS: 3600, energyKcal: nil, avgHr: 150, maxHr: 178,
+                                strain: 14.0, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
+        let strava = WorkoutRow(startTs: 1030, endTs: 4580, sport: "Running", source: "health-connect",
+                                 durationS: 3550, energyKcal: nil, avgHr: nil, maxHr: nil,
+                                 strain: nil, distanceM: 8_200, zonesJSON: nil, notes: nil, steps: nil)
+        let out = WorkoutSource.dedupCrossSource([whoop, strava])
+        XCTAssertEqual(out.count, 1)
+        let kept = out[0]
+        XCTAssertEqual(kept.source, "whoop")        // identity: the richer, strap-native row
+        XCTAssertEqual(kept.strain, 14.0)           // WHOOP's own signal
+        XCTAssertEqual(kept.distanceM, 8_200)       // borrowed from Strava/HC
+    }
+
+    func testDedupTraceAttributionUnaffectedByBlending() {
+        // The trace must still name the TRUE preferred() winner/loser even though the row it displays is
+        // now an enriched blend — a regression this exact change could introduce if blend()'s output were
+        // used for the identity check instead of preferred()'s.
+        let whoop = WorkoutRow(startTs: 1000, endTs: 4600, sport: "Running", source: "whoop",
+                                durationS: 3600, energyKcal: nil, avgHr: 150, maxHr: 178,
+                                strain: 14.0, distanceM: nil, zonesJSON: nil, notes: nil, steps: nil)
+        let strava = WorkoutRow(startTs: 1030, endTs: 4580, sport: "Running", source: "health-connect",
+                                 durationS: 3550, energyKcal: nil, avgHr: nil, maxHr: nil,
+                                 strain: nil, distanceM: 8_200, zonesJSON: nil, notes: nil, steps: nil)
+        let (kept, trace) = WorkoutSource.dedupCrossSourceTrace([whoop, strava])
+        XCTAssertEqual(kept.count, 1)
+        XCTAssertEqual(trace.count, 1)
+        XCTAssertTrue(trace[0].contains("kept=strap"))
+        XCTAssertTrue(trace[0].contains("dropped=apple"))
+        // The displayed row is still the enriched blend, not a bare preferred() pick.
+        XCTAssertEqual(kept[0].distanceM, 8_200)
+    }
+
     // MARK: - detected-vs-real overlap collapse (#975)
 
     func testDetectedShadowIsDroppedWhenItOverlapsAManualSession() {

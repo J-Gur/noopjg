@@ -178,6 +178,10 @@ enum WorkoutSource: Equatable {
     /// Of two same-activity rows, the one to KEEP. Prefer the richer (more captured signals); on a tie
     /// prefer the strap-native source (live/manual/detected/whoop carry the real trace) over a thin
     /// import (Apple Health / Health Connect); final tie → the longer session, then `a` (stable).
+    ///
+    /// Returns one of `a`/`b` UNCHANGED, never a merged value — `collapseCrossSource`'s trace path
+    /// relies on that (`winner == kept[idx]`) to attribute which side won. `blend` is the function
+    /// that produces the enriched row actually kept/displayed; this one only decides identity.
     static func preferred(_ a: WorkoutRow, _ b: WorkoutRow) -> WorkoutRow {
         let ra = richness(a), rb = richness(b)
         if ra != rb { return ra > rb ? a : b }
@@ -186,6 +190,42 @@ enum WorkoutSource: Equatable {
         let da = a.endTs - a.startTs, db = b.endTs - b.startTs
         if da != db { return da > db ? a : b }
         return a
+    }
+
+    /// The row actually kept for a same-activity pair: `preferred`'s winner, enriched with any of the
+    /// loser's fields the winner itself lacks. A live WHOOP session and its Health-Connect-imported
+    /// twin (e.g. Strava via HC) commonly carry DISJOINT signals — HR/strain/zones from the strap,
+    /// distance/energy/route from the import — and `preferred` alone picks one row wholesale, silently
+    /// dropping the other's unique data. This keeps the winner's IDENTITY untouched (deviceId/startTs/
+    /// sport/source), so every downstream consumer that treats the result as "a real row at this key"
+    /// (edit, delete, duplicate-as-manual, detail view) still works exactly as before — the borrowed
+    /// fields are display-only enrichment, never persisted back to either original row.
+    ///
+    /// Only fills a field the winner is missing; never overwrites one the winner already has, so this
+    /// can never make a rich strap session look worse for the wrong reason. Mirrors the `richness`
+    /// field set, plus distance/energy. Every `WorkoutRow` field is `let`, so this rebuilds via the
+    /// memberwise init rather than mutating in place — mirrors Kotlin `WorkoutMerge.blend`, EXCEPT for
+    /// `routePolyline`: this struct has no such field at all (unlike Kotlin's), because Swift keeps
+    /// route geometry in a separate keyed `RouteStore`, not on `WorkoutRow` itself — that
+    /// reconciliation, if wanted, belongs wherever the caller re-attaches a route for display, not here.
+    static func blend(_ a: WorkoutRow, _ b: WorkoutRow) -> WorkoutRow {
+        let winner = preferred(a, b)
+        let loser = winner == a ? b : a
+        return WorkoutRow(
+            startTs: winner.startTs,
+            endTs: winner.endTs,
+            sport: winner.sport,
+            source: winner.source,
+            durationS: winner.durationS,
+            energyKcal: (winner.energyKcal ?? 0) > 0 ? winner.energyKcal : loser.energyKcal,
+            avgHr: winner.avgHr ?? loser.avgHr,
+            maxHr: winner.maxHr ?? loser.maxHr,
+            strain: winner.strain ?? loser.strain,
+            distanceM: (winner.distanceM ?? 0) > 0 ? winner.distanceM : loser.distanceM,
+            zonesJSON: (winner.zonesJSON?.isEmpty == false) ? winner.zonesJSON : loser.zonesJSON,
+            notes: winner.notes,
+            steps: winner.steps
+        )
     }
 
     // MARK: - Detected-vs-real overlap collapse (#975)
@@ -238,7 +278,10 @@ enum WorkoutSource: Equatable {
     /// ONCE per row (not twice per comparison), rows are bucketed by it, and a candidate only ever compares
     /// against kept rows of the SAME sport (a cross-sport pair can never be `sameActivity`). That removes the
     /// per-comparison string-normalisation that made a large imported history freeze the workout screens.
-    /// `onMerge` is invoked with (winner, loser) for each collapsed pair so the trace path can record it.
+    /// `onMerge` is invoked with (winner, loser) for each collapsed pair so the trace path can record it —
+    /// `preferred`'s unmodified result, NOT the `blend`ed row actually stored in `kept`, so the winner/
+    /// loser attribution can never be thrown off by `blend` returning a value that no longer equals
+    /// either input.
     private static func collapseCrossSource(
         _ input: [WorkoutRow],
         onMerge: ((_ winner: WorkoutRow, _ loser: WorkoutRow) -> Void)? = nil
@@ -257,7 +300,7 @@ enum WorkoutSource: Equatable {
                     // are byte-identical the label is interchangeable, so == is correct in every case.
                     onMerge(winner, winner == kept[idx] ? row : kept[idx])
                 }
-                kept[idx] = winner
+                kept[idx] = blend(kept[idx], row)
                 merged = true
                 break
             }
