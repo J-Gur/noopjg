@@ -51,4 +51,32 @@ final class RestWiringImpactTests: XCTestCase {
         // T1: a genuine long sleeper's need exceeds the old fixed 8h (more demanding duration term).
         XCTAssertGreaterThan(longS.need, 8.0)
     }
+
+    // MARK: - #1727: the `daily:`-based overload must ALSO forward need/consistency
+    //
+    // Everything above exercises the raw-seconds `composite(tstSeconds:...)` overload. But
+    // `IntelligenceEngine.recomputeRecovery` / `recomputeChargeDrivers` / the persisted `sleep_performance`
+    // write all call the DailyMetric-based `composite(daily:)` overload instead (the raw per-night streams
+    // are gone by pass 2), and until #1727 they called it with NO needHours/consistency arguments at all —
+    // silently falling back to this overload's own defaults (neutral 0.5, flat 8h) even though the real
+    // personalized values were sitting in scope the whole time. Pins that the `daily:` overload actually
+    // forwards them (not just that the raw-seconds one does), so that specific call shape can't regress.
+    func testDailyOverloadThreadsRealNeedAndConsistency() throws {
+        let d = DailyMetric(day: "2026-01-01", totalSleepMin: 420, efficiency: 0.90,
+                            deepMin: 60, remMin: 90, lightMin: 270, disturbances: 2,
+                            restingHr: 52, avgHrv: 60, recovery: nil, strain: nil, exerciseCount: nil)
+        let withDefaults = try XCTUnwrap(Rest.composite(daily: d))
+        // A personalized need BELOW the 8h default (raises the duration term) and a real consistency
+        // ABOVE neutral 0.5 (raises the consistency term) each push the score up on their own, and
+        // together push it up further , three unambiguous, tolerance-free directions that don't depend
+        // on hand-computing the exact weighted sum.
+        let needOnly = try XCTUnwrap(Rest.composite(daily: d, needHours: 7.5, consistency: nil))
+        let consistencyOnly = try XCTUnwrap(Rest.composite(daily: d, needHours: Rest.defaultNeedHours,
+                                                            consistency: 0.8))
+        let both = try XCTUnwrap(Rest.composite(daily: d, needHours: 7.5, consistency: 0.8))
+        XCTAssertGreaterThan(needOnly, withDefaults)
+        XCTAssertGreaterThan(consistencyOnly, withDefaults)
+        XCTAssertGreaterThan(both, needOnly)
+        XCTAssertGreaterThan(both, consistencyOnly)
+    }
 }

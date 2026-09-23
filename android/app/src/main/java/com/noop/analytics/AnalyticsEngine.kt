@@ -1613,9 +1613,14 @@ object RestScorer {
      * Rest composite [0,100] derived from a persisted [DailyMetric] (the pass-2 / display path — raw
      * streams are gone but the night's totals remain). null when there's no sleep. Single source of
      * truth so the persisted sleep_performance series and the Charge "Rest quality" term agree. Mirrors
-     * Swift `AnalyticsEngine.Rest.composite(daily:)`.
+     * Swift `AnalyticsEngine.Rest.composite(daily:needHours:consistency:)`.
+     *
+     * [sleepNeedHours]/[consistency] default to null (→ the flat population need / neutral 0.5), but a
+     * caller scoring a REAL day should pass the real per-pass personal traits (the SAME
+     * [personalizedNeedHours] / [VitalityEngine.sleepConsistency] values threaded into `analyzeDay`) —
+     * see IntelligenceEngine.recomputeRecovery. (#1727)
      */
-    fun restFromDaily(daily: DailyMetric, consistency: Double? = null): Double? {
+    fun restFromDaily(daily: DailyMetric, sleepNeedHours: Double? = null, consistency: Double? = null): Double? {
         val tstMin = daily.totalSleepMin ?: return null
         val eff = daily.efficiency ?: return null
         if (tstMin <= 0.0) return null
@@ -1624,7 +1629,7 @@ object RestScorer {
             efficiency = eff,
             deepSeconds = (daily.deepMin ?: 0.0) * 60.0,
             remSeconds = (daily.remMin ?: 0.0) * 60.0,
-            sleepNeedHours = null,
+            sleepNeedHours = sleepNeedHours,
             consistency = consistency,
         )
     }

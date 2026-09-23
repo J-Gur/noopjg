@@ -1,6 +1,8 @@
 package com.noop.analytics
 
+import com.noop.data.DailyMetric
 import java.util.Locale
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -66,5 +68,42 @@ class RestWiringImpactTest {
         assertTrue(shortS.need >= 7.0)
         // T1: a genuine long sleeper's need exceeds the old fixed 8h (more demanding duration term).
         assertTrue(longS.need > 8.0)
+    }
+
+    // #1727: the DailyMetric-based overload must ALSO forward need/consistency
+    //
+    // Everything above exercises the raw-seconds `rest(...)` overload. But
+    // `IntelligenceEngine.recomputeRecovery` / the persisted `sleep_performance` write all call
+    // `RestScorer.restFromDaily(daily)` instead (the raw per-night streams are gone by pass 2), and until
+    // #1727 they called it with NO sleepNeedHours/consistency arguments at all — silently falling back to
+    // this overload's own defaults (neutral 0.5, flat 8h) even though the real personalized values were
+    // sitting in scope the whole time. Pins that `restFromDaily` actually forwards them (not just that the
+    // raw-seconds `rest(...)` does), so that specific call shape can't regress. Mirrors the Swift
+    // `testDailyOverloadThreadsRealNeedAndConsistency`.
+    @Test
+    fun dailyOverloadThreadsRealNeedAndConsistency() {
+        val d = DailyMetric(
+            deviceId = "test", day = "2026-01-01", totalSleepMin = 420.0, efficiency = 0.90,
+            deepMin = 60.0, remMin = 90.0, lightMin = 270.0, disturbances = 2,
+            restingHr = 52, avgHrv = 60.0,
+        )
+        val withDefaults = RestScorer.restFromDaily(d)
+        // A personalized need BELOW the 8h default (raises the duration term) and a real consistency
+        // ABOVE neutral 0.5 (raises the consistency term) each push the score up on their own, and
+        // together push it up further , three unambiguous, tolerance-free directions that don't depend
+        // on hand-computing the exact weighted sum.
+        val needOnly = RestScorer.restFromDaily(d, sleepNeedHours = 7.5, consistency = null)
+        val consistencyOnly = RestScorer.restFromDaily(
+            d, sleepNeedHours = RestScorer.defaultSleepNeedHours, consistency = 0.8,
+        )
+        val both = RestScorer.restFromDaily(d, sleepNeedHours = 7.5, consistency = 0.8)
+        assertNotNull(withDefaults)
+        assertNotNull(needOnly)
+        assertNotNull(consistencyOnly)
+        assertNotNull(both)
+        assertTrue(needOnly!! > withDefaults!!)
+        assertTrue(consistencyOnly!! > withDefaults)
+        assertTrue(both!! > needOnly)
+        assertTrue(both > consistencyOnly)
     }
 }
