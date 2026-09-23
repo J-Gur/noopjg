@@ -2764,7 +2764,8 @@ private fun ScoreHeroRow(
 
 /**
  * One hero ring column: the ring, with a tappable UPPERCASE domain label + chevron beneath it (the
- * WHOOP affordance) that opens the matching scoring-guide section. Provenance belongs to the whole hero
+ * WHOOP affordance) that opens the matching scoring-guide section, or the ring's own [onRingTap] target
+ * when it has one (Charge: the "what shaped it" breakdown). Provenance belongs to the whole hero
  * card and is rendered once by [ScoreHeroRow], so this column only owns score content and navigation.
  */
 @Composable
@@ -2792,7 +2793,8 @@ private fun HeroRingColumn(
     ) {
         if (onRingTap != null) {
             // liquidPress on the tappable Charge vessel so it settles inward on press (the vessel itself
-            // also splashes via LiquidVessel's own tap). Same interactionSource on the clickable + press.
+            // also splashes via LiquidVessel's own tap, which observes without consuming so this clickable
+            // still fires). Same interactionSource on the clickable + press.
             val ringInteraction = remember { MutableInteractionSource() }
             Box(
                 modifier = Modifier
@@ -2822,7 +2824,9 @@ private fun HeroRingColumn(
             modifier = Modifier
                 .fillMaxWidth()
                 .clip(RoundedCornerShape(50))
-                .clickable { onInfo() }
+                // Charge's chevron opens the same breakdown as its ring, as on iOS (its richest explanation);
+                // Effort / Rest, which have no ring target yet, open their scoring-guide section.
+                .clickable { (onRingTap ?: onInfo)() }
                 .padding(vertical = Metrics.space2),
             contentAlignment = Alignment.Center,
         ) {
@@ -2843,7 +2847,11 @@ private fun HeroRingColumn(
             )
             Icon(
                 Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                contentDescription = uiString(R.string.l10n_today_screen_how_domain_label_is_calculated_8897768c, domainLabel),
+                contentDescription = if (onRingTap != null) {
+                    uiString(R.string.today_action_see_what_shaped, domainLabel)
+                } else {
+                    uiString(R.string.l10n_today_screen_how_domain_label_is_calculated_8897768c, domainLabel)
+                },
                 tint = Palette.textSecondary.copy(alpha = 0.6f),
                 modifier = Modifier
                     .align(Alignment.CenterEnd)
