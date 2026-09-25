@@ -5,6 +5,8 @@ import com.noop.analytics.BaselineState
 import com.noop.analytics.Baselines
 import com.noop.analytics.ChargeDriver
 import com.noop.analytics.RecoveryDrivers
+import com.noop.analytics.RestDriver
+import com.noop.analytics.RestDrivers
 import com.noop.analytics.RestScorer
 import com.noop.analytics.ScoreConfidence
 import com.noop.data.DailyMetric
@@ -47,6 +49,21 @@ internal fun recoveryCalibrationNights(
 }
 
 /**
+ * One day's resolved Rest inputs - the SAME merged `sleep_performance` / `sleep_need_hours` /
+ * `sleep_consistency` metricSeries the Rest ring itself reads (imported-wins where an import carries
+ * one, else the NOOP-computed pass's own value, #1727). Built ONCE by the caller (TodayScreen, from
+ * three [com.noop.data.WhoopRepository.resolvedSeries] reads) and threaded to both
+ * [recoveryChargeDrivers] (the Charge Sleep-quality term) and [recoveryRestDrivers] (the Rest
+ * breakdown), so neither independently re-derives Rest with [RestScorer]'s neutral/flat defaults - the
+ * exact gap #1727 closed on the engine side, mirrored here on the UI side.
+ */
+internal data class RestSeriesRow(
+    val performance: Double?,
+    val needHours: Double?,
+    val consistency: Double?,
+)
+
+/**
  * The ordered "What shaped it" Charge driver rows for [displayDay], rebuilt PURELY from the visible
  * [days] history (the same in-memory rows the dashboard already shows, imports win field-by-field in
  * the merge), so no engine round-trip is needed and the bars match the Charge ring's own inputs. Folds
@@ -60,6 +77,7 @@ internal fun recoveryCalibrationNights(
 internal fun recoveryChargeDrivers(
     days: List<DailyMetric>,
     displayDay: DailyMetric?,
+    restSeriesByDay: Map<String, RestSeriesRow> = emptyMap(),
 ): List<ChargeDriver> {
     val day = displayDay ?: return emptyList()
     val hrv = day.avgHrv ?: return emptyList()
@@ -72,9 +90,12 @@ internal fun recoveryChargeDrivers(
     val rhrBase = Baselines.foldHistory(ordered.map { it.restingHr?.toDouble() }, Baselines.restingHRCfg)
     val respBase = Baselines.foldHistory(ordered.map { it.respRateBpm }, Baselines.respCfg).takeIf { it.usable }
 
-    // sleepPerf: the Rest COMPOSITE (/100) when stages exist, else raw efficiency, the SAME derivation
-    // recomputeRecovery uses, so the Sleep driver scores against the headline's own input.
-    val sleepPerf = RestScorer.restFromDaily(day)?.let { it / 100.0 } ?: day.efficiency
+    // sleepPerf: the RESOLVED sleep_performance series value (imported-wins, the SAME number the Rest
+    // ring shows for this day) when one exists, else raw efficiency. #1727: this used to call
+    // RestScorer.restFromDaily(day) directly, independently re-deriving Rest with the composite's
+    // neutral/flat defaults - which could disagree with the actual (now-corrected) persisted score.
+    // Reading the resolved series instead matches the existing iOS TodayView.chargeBreakdown() pattern.
+    val sleepPerf = restSeriesByDay[day.day]?.performance?.let { it / 100.0 } ?: day.efficiency
 
     return RecoveryDrivers.chargeDrivers(
         hrv = hrv,
@@ -86,6 +107,25 @@ internal fun recoveryChargeDrivers(
         sleepPerf = sleepPerf,
         skinTempDev = day.skinTempDevC,
     )
+}
+
+/**
+ * The ordered "What shaped it" Rest driver rows for [displayDay] (SHARED CONTRACT, #1727). Unlike
+ * [recoveryChargeDrivers] (which folds the whole HRV/RHR history itself), Rest's composite needs no
+ * baseline fold - its two personal traits (need hours, consistency) are the engine's own per-pass
+ * values, PERSISTED per night rather than re-derived here, so the breakdown can only ever show numbers
+ * that byte-match what actually scored the night. Empty when [displayDay] has no resolved Rest series
+ * row for that day (a cold night, or an imported score with no NOOP-computed term breakdown to show),
+ * mirroring [RestDrivers.drivers]'s own no-sleep gate.
+ */
+internal fun recoveryRestDrivers(
+    displayDay: DailyMetric?,
+    restSeriesByDay: Map<String, RestSeriesRow>,
+): List<RestDriver> {
+    val day = displayDay ?: return emptyList()
+    val row = restSeriesByDay[day.day] ?: return emptyList()
+    val needHours = row.needHours ?: return emptyList()
+    return RestDrivers.drivers(daily = day, needHours = needHours, consistency = row.consistency)
 }
 
 /**

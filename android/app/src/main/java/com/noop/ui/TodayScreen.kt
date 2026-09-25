@@ -156,6 +156,10 @@ import com.noop.analytics.DayCycleIntelligenceIntegration
 import com.noop.analytics.HydrationGoal
 import com.noop.analytics.HydrationStore
 import com.noop.analytics.ReadinessEngine
+import com.noop.analytics.RestDriver
+import com.noop.analytics.RestDriverLabel
+import com.noop.analytics.RestDriverUnit
+import com.noop.analytics.RestDriverVerdict
 import com.noop.analytics.ScoreConfidence
 import com.noop.analytics.SleepMark
 import com.noop.analytics.SleepMarkType
@@ -684,6 +688,8 @@ fun TodayScreen(
     // existing RecoveryDriversSection (gated to the calibration countdown when the night can't score) plus
     // the folded Readiness card (S4). Not persisted, so it reopens closed. Mirrors iOS showChargeBreakdown.
     var showChargeBreakdown by remember { mutableStateOf(false) }
+    // #1727: same idea, the Rest breakdown sheet opened by tapping the hero Rest ring.
+    var showRestBreakdown by remember { mutableStateOf(false) }
     // #1694: the Latest-Workouts tile that was tapped. Held HERE, not inside the section: the Today
     // sections are LazyColumn items, and a disposed item would take an open sheet down with it.
     var selectedWorkoutRow by remember { mutableStateOf<WorkoutRow?>(null) }
@@ -881,6 +887,27 @@ fun TodayScreen(
         restScoreForDay = freshRestScore(
             todayValue = byDay[selectedDayKey], lastDay = latest?.key, lastValue = latest?.value,
             isTodaySelected = selectedDayOffset == 0, today = selectedDayKey)
+    }
+
+    // #1727: the SAME resolved sleep_performance series above, plus its two per-night personal traits
+    // (sleep_need_hours, sleep_consistency), keyed by day. This is what the Charge "Sleep quality" driver
+    // term and the Rest breakdown's own driver rows read, instead of each independently re-deriving Rest
+    // with RestScorer's neutral/flat defaults (the Android-side gap #1727 closed on the engine; this
+    // mirrors it here). Empty until loaded; a day with no entry (cold night, or an import with no
+    // NOOP-computed term breakdown) honestly yields no Rest breakdown rather than a faked one.
+    var restSeriesByDay by remember { mutableStateOf<Map<String, RestSeriesRow>>(emptyMap()) }
+    LaunchedEffect(days) {
+        suspend fun series(key: String): Map<String, Double> = runCatching {
+            viewModel.repo.resolvedSeries(key, "my-whoop", "0000-00-00", "9999-99-99",
+                strapDeviceId = viewModel.activeStrapId)
+                .values.associate { it.first to it.second }
+        }.getOrDefault(emptyMap())
+        val performance = series("sleep_performance")
+        val needHours = series("sleep_need_hours")
+        val consistency = series("sleep_consistency")
+        restSeriesByDay = (performance.keys + needHours.keys + consistency.keys).associateWith { day ->
+            RestSeriesRow(performance = performance[day], needHours = needHours[day], consistency = consistency[day])
+        }
     }
 
     // The Rest tile's SPARKLINE series (#614 follow-up). The Rest tile's NUMBER is the Rest composite
@@ -1508,6 +1535,7 @@ fun TodayScreen(
                                     heroSourceLabel = heroSourceLabel,
                                     onScoreInfo = openGuide,
                                     onChargeTap = { showChargeBreakdown = true },
+                                    onRestTap = { showRestBreakdown = true },
                                     // #1164: today's Rest is provisional while the strap has banked records
                                     // not yet offloaded — show "Pending sync" instead of a number that moves.
                                     restPendingSync = restPendingSync(
@@ -1820,6 +1848,27 @@ fun TodayScreen(
                 onHowCalculated = {
                     showChargeBreakdown = false
                     openGuide(ScoreSection.CHARGE)
+                },
+                restSeriesByDay = restSeriesByDay,
+            )
+        }
+    }
+
+    // #1727: the Rest breakdown sheet, opened by tapping the hero Rest ring, mirroring the Charge
+    // breakdown's own Dialog presentation. A calibrating/no-sleep night (empty drivers) renders nothing
+    // inside RestDriversSection's own gate, never a blank sheet.
+    if (showRestBreakdown) {
+        Dialog(
+            onDismissRequest = { showRestBreakdown = false },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            RestBreakdownSheet(
+                displayDay = displayMetric,
+                restSeriesByDay = restSeriesByDay,
+                onClose = { showRestBreakdown = false },
+                onHowCalculated = {
+                    showRestBreakdown = false
+                    openGuide(ScoreSection.REST)
                 },
             )
         }
@@ -2590,6 +2639,8 @@ private fun ScoreHeroRow(
     // A1 (#514/#706): tapping the Charge ring opens the breakdown sheet. A small chevron cue overlays the
     // ring's bottom edge INSIDE the ring frame, so it adds no stacked height (the #762 self-sizing parity).
     onChargeTap: (() -> Unit)? = null,
+    // #1727: same idea for Rest, opening its own "what shaped it" breakdown.
+    onRestTap: (() -> Unit)? = null,
     // #1164: pending-sync state for today's Rest (strap has banked records not yet offloaded). When true
     // the Rest vessel shows "Pending sync" instead of a provisional number that will change.
     restPendingSync: Boolean = false,
@@ -2711,6 +2762,7 @@ private fun ScoreHeroRow(
                         modifier = Modifier.width(col),
                         domain = DomainTheme.Rest,
                         onInfo = { onScoreInfo(ScoreSection.REST) },
+                        onRingTap = onRestTap,
                     ) {
                         Box(contentAlignment = Alignment.Center) {
                             HeroScoreVessel(
@@ -4662,6 +4714,10 @@ internal fun ChargeBreakdownSheet(
     showReadiness: Boolean,
     onClose: () -> Unit,
     onHowCalculated: () -> Unit,
+    // #1727: the resolved sleep_performance/need/consistency series, so the Sleep-quality driver term
+    // reads the SAME number the Rest ring shows instead of re-deriving it with defaults. Defaults to
+    // empty (the pre-#1727 fallback-to-efficiency behavior) for callers that haven't been wired yet.
+    restSeriesByDay: Map<String, RestSeriesRow> = emptyMap(),
 ) {
     Surface(modifier = Modifier.fillMaxSize(), color = Palette.surfaceBase) {
         Column(modifier = Modifier.fillMaxSize()) {
@@ -4691,7 +4747,8 @@ internal fun ChargeBreakdownSheet(
             ) {
                 // The breakdown self-gates: a calibrating night (empty drivers) renders nothing here, the
                 // Contributors + Readiness below still give an honest read, never a blank sheet.
-                RecoveryDriversSection(days = days, displayDay = displayDay, carriedDay = carriedDay)
+                RecoveryDriversSection(days = days, displayDay = displayDay, carriedDay = carriedDay,
+                    restSeriesByDay = restSeriesByDay)
                 RecoveryContributorsSection(day = displayDay, carriedDay = carriedDay)
                 // S4: the SEPARATE Readiness block now lives here behind the Charge-ring tap (today-only,
                 // matching the old inline gate). A one-word read (Push / Maintain / Rest) stays on the hero.
@@ -4764,11 +4821,14 @@ private fun RecoveryDriversSection(
     days: List<DailyMetric>,
     displayDay: DailyMetric?,
     carriedDay: DailyMetric? = null,
+    restSeriesByDay: Map<String, RestSeriesRow> = emptyMap(),
 ) {
     // Read the row the Charge ring itself reads: today's own when scored, else the carried last-scored
     // day (#543) so the breakdown matches the carried ring instead of vanishing at the rollover.
     val readDay = carriedDay ?: displayDay
-    val drivers = remember(days, readDay) { recoveryChargeDrivers(days, readDay) }
+    val drivers = remember(days, readDay, restSeriesByDay) {
+        recoveryChargeDrivers(days, readDay, restSeriesByDay)
+    }
     if (drivers.isEmpty()) return
 
     val tier = remember(days, readDay) { chargeConfidenceTier(days, readDay) }
@@ -4896,6 +4956,215 @@ private fun DriverRow(driver: ChargeDriver) {
         Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
             Text(valueText, style = NoopType.captionNumber, color = Palette.textPrimary)
             Text(baselineText, style = NoopType.footnote, color = Palette.textTertiary)
+        }
+    }
+}
+
+/**
+ * #1727: the Rest breakdown sheet opened by tapping the hero Rest ring, mirroring [ChargeBreakdownSheet]'s
+ * own presentation (full-screen surface, titled top bar with Close, scrollable body). Built only when
+ * shown (the caller gates on showRestBreakdown), so the rows materialise on tap. Nothing is recomputed
+ * here beyond [recoveryRestDrivers], which reads the SAME resolved series the Rest ring itself shows.
+ */
+@Composable
+internal fun RestBreakdownSheet(
+    displayDay: DailyMetric?,
+    restSeriesByDay: Map<String, RestSeriesRow>,
+    onClose: () -> Unit,
+    onHowCalculated: () -> Unit,
+) {
+    Surface(modifier = Modifier.fillMaxSize(), color = Palette.surfaceBase) {
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = Metrics.screenPadding, vertical = Metrics.gap),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    uiString(R.string.l10n_today_screen_what_shaped_your_rest),
+                    style = NoopType.headline,
+                    color = Palette.textPrimary,
+                    modifier = Modifier.weight(1f),
+                )
+                IconButton(onClick = onClose) {
+                    Icon(Icons.Filled.Close, contentDescription = uiString(R.string.l10n_today_screen_close_bbfa773e), tint = Palette.textSecondary)
+                }
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = Metrics.screenPadding)
+                    .padding(bottom = Metrics.sectionGap),
+                verticalArrangement = Arrangement.spacedBy(Metrics.sectionGap),
+            ) {
+                // Self-gates: a night with no resolved Rest series (cold-start / import with no NOOP term
+                // breakdown) renders nothing here rather than a blank sheet.
+                RestDriversSection(displayDay = displayDay, restSeriesByDay = restSeriesByDay)
+                // Everything above is what shaped YOUR Rest tonight; this opens the general METHOD behind
+                // the score, so the two are clearly separated, not conflated. Mirrors ChargeBreakdownSheet's
+                // own "How Charge is calculated" row.
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(14.dp))
+                        .clickable(
+                            onClickLabel = uiString(R.string.today_action_how_rest),
+                            onClick = onHowCalculated,
+                        )
+                        .background(Palette.surfaceInset)
+                        .padding(14.dp)
+                        .semantics {
+                            contentDescription = uiString(R.string.l10n_today_screen_how_rest_is_calculated_the_method)
+                        },
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp),
+                ) {
+                    Icon(
+                        Icons.Filled.Functions,
+                        contentDescription = null,
+                        tint = DomainTheme.Rest.color,
+                        modifier = Modifier.size(14.dp),
+                    )
+                    Column(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(1.dp),
+                    ) {
+                        Text(
+                            uiString(R.string.l10n_today_screen_how_rest_is_calculated),
+                            style = NoopType.subhead,
+                            color = Palette.textPrimary,
+                        )
+                        Text(
+                            uiString(R.string.l10n_today_screen_the_method_behind_the_score_not_5bc68508),
+                            style = NoopType.caption,
+                            color = Palette.textTertiary,
+                        )
+                    }
+                    Icon(
+                        Icons.AutoMirrored.Filled.KeyboardArrowRight,
+                        contentDescription = null,
+                        tint = Palette.textTertiary,
+                        modifier = Modifier.size(12.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - "What shaped it" the engine-computed Rest driver breakdown
+//
+// The SHARED-CONTRACT driver rows under the Rest ring: one row per term the Rest composite weighs
+// (duration, efficiency, restorative sleep, consistency), each carrying the EXACT points it earned
+// toward the 0-100 score (the four rows sum to the headline, mod rounding - Rest is a linear weighted
+// sum, unlike Charge's marginal deltas), the night's value, the target it was scored against (when one
+// exists), and a short plain-English verdict. Computed by RestDrivers.drivers from the SAME resolved
+// per-night sleep_need_hours/sleep_consistency the Rest ring's own score used (#1727), so a row can
+// never describe a night differently than the ring does. Hidden entirely when there is no resolved Rest
+// series for the day. No em-dashes.
+
+@Composable
+private fun RestDriversSection(
+    displayDay: DailyMetric?,
+    restSeriesByDay: Map<String, RestSeriesRow>,
+) {
+    val drivers = remember(displayDay, restSeriesByDay) {
+        recoveryRestDrivers(displayDay, restSeriesByDay)
+    }
+    if (drivers.isEmpty()) return
+
+    Column(verticalArrangement = Arrangement.spacedBy(Metrics.gap)) {
+        SectionHeader(uiString(R.string.today_what_shaped_it), overline = uiString(R.string.trends_rest),
+            trailing = uiString(R.string.today_vs_your_target))
+        NoopCard {
+            Column(verticalArrangement = Arrangement.spacedBy(Metrics.space16)) {
+                drivers.forEach { RestDriverRow(it) }
+                Text(
+                    uiString(R.string.today_rest_driver_guidance),
+                    style = NoopType.footnote,
+                    color = Palette.textTertiary,
+                )
+            }
+        }
+    }
+}
+
+/** One Rest "What shaped it" row: an earned/max points chip (always non-negative - Rest earns points
+ *  toward its ceiling, it never penalises below zero like Charge's signed delta), the label + verdict,
+ *  and the value over its target (when the term has one; efficiency/consistency read against an
+ *  implicit 100% and show no second line). Mirrors DriverRow's Charge layout. */
+@Composable
+private fun RestDriverRow(driver: RestDriver) {
+    // Tone ramps by how much of the term's ceiling was earned, not a supporting/limiting direction -
+    // Rest doesn't argue a physiological direction the way Charge's signed delta does.
+    val fraction = if (driver.maxPoints > 0) driver.earnedPoints.toFloat() / driver.maxPoints else 0f
+    val tone = when {
+        fraction >= 0.75f -> Palette.statusPositive
+        fraction >= 0.5f -> Palette.textSecondary
+        else -> Palette.statusCritical
+    }
+    val label = when (driver.label) {
+        RestDriverLabel.SLEEP_DURATION -> uiString(R.string.today_driver_rest_duration)
+        RestDriverLabel.SLEEP_EFFICIENCY -> uiString(R.string.today_driver_rest_efficiency)
+        RestDriverLabel.RESTORATIVE_SLEEP -> uiString(R.string.today_driver_rest_restorative)
+        RestDriverLabel.SLEEP_CONSISTENCY -> uiString(R.string.today_driver_rest_consistency)
+    }
+    val valueText = when (driver.unit) {
+        RestDriverUnit.HOURS -> uiString(
+            R.string.today_driver_rest_value_hours,
+            driver.value.toInt(), ((driver.value - driver.value.toInt()) * 60).roundToInt(),
+        )
+        RestDriverUnit.PERCENT -> uiString(R.string.today_driver_rest_value_percent, driver.value.roundToInt())
+    }
+    val targetText = driver.target?.let { target -> when (driver.unit) {
+        RestDriverUnit.HOURS -> uiString(
+            R.string.today_driver_rest_target_hours_need,
+            target.toInt(), ((target - target.toInt()) * 60).roundToInt(),
+        )
+        RestDriverUnit.PERCENT -> uiString(R.string.today_driver_rest_target_percent, target.roundToInt())
+    } } ?: ""
+    val verdict = when (driver.verdict) {
+        RestDriverVerdict.MET_SLEEP_NEED -> uiString(R.string.today_driver_rest_met_sleep_need)
+        RestDriverVerdict.SHORT_OF_SLEEP_NEED -> uiString(R.string.today_driver_rest_short_of_sleep_need)
+        RestDriverVerdict.WELL_SHORT_OF_SLEEP_NEED -> uiString(R.string.today_driver_rest_well_short_of_sleep_need)
+        RestDriverVerdict.HIGH_EFFICIENCY -> uiString(R.string.today_driver_rest_high_efficiency)
+        RestDriverVerdict.TYPICAL_EFFICIENCY -> uiString(R.string.today_driver_rest_typical_efficiency)
+        RestDriverVerdict.LOWER_EFFICIENCY -> uiString(R.string.today_driver_rest_lower_efficiency)
+        RestDriverVerdict.PLENTY_DEEP_AND_REM -> uiString(R.string.today_driver_rest_plenty_deep_rem)
+        RestDriverVerdict.TYPICAL_DEEP_AND_REM -> uiString(R.string.today_driver_rest_typical_deep_rem)
+        RestDriverVerdict.LIGHT_DEEP_AND_REM -> uiString(R.string.today_driver_rest_light_deep_rem)
+        RestDriverVerdict.REGULAR_SCHEDULE -> uiString(R.string.today_driver_rest_regular_schedule)
+        RestDriverVerdict.FAIRLY_REGULAR_SCHEDULE -> uiString(R.string.today_driver_rest_fairly_regular_schedule)
+        RestDriverVerdict.IRREGULAR_SCHEDULE -> uiString(R.string.today_driver_rest_irregular_schedule)
+    }
+    val driverA11y = uiString(R.string.today_driver_rest_a11y, label, valueText, targetText,
+        driver.earnedPoints, driver.maxPoints, verdict)
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = Modifier.semantics { contentDescription = driverA11y },
+    ) {
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .clip(RoundedCornerShape(Metrics.cornerPill))
+                .background(tone.copy(alpha = 0.12f))
+                .padding(horizontal = 8.dp, vertical = 4.dp),
+        ) {
+            Text(
+                uiString(R.string.today_driver_rest_points, driver.earnedPoints, driver.maxPoints),
+                style = NoopType.captionNumber, color = tone,
+            )
+        }
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(label, style = NoopType.headline, color = Palette.textPrimary)
+            Text(verdict, style = NoopType.footnote, color = Palette.textSecondary)
+        }
+        Column(horizontalAlignment = Alignment.End, verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(valueText, style = NoopType.captionNumber, color = Palette.textPrimary)
+            Text(targetText, style = NoopType.footnote, color = Palette.textTertiary)
         }
     }
 }

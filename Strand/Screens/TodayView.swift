@@ -332,6 +332,12 @@ struct TodayView: View {
     // tile previously showed hours where the score belonged (#248). nil until loaded / no night yet.
     @State private var restScore: Double?
 
+    /// #1727: one day's resolved `sleep_need_hours` / `sleep_consistency` - the SAME personal traits the
+    /// persisted Rest score was scored against for that night, keyed by day. Loaded independently of
+    /// `loadDayScoped()`'s cached day-scoped snapshot (a whole-history read, not day-scoped, and cheap:
+    /// two metricSeries reads), so the Rest breakdown never needs to wait on or invalidate that cache.
+    @State private var restSeriesByDay: [String: (needHours: Double, consistency: Double?)] = [:]
+
     // The raw per-day merge winners remain available for watch-specific confidence behavior.
     @State private var provenanceByMetric: [String: String] = [:]
     /// The sensor/import provider behind each score cell. Computed rows without durable provenance are
@@ -486,6 +492,8 @@ struct TodayView: View {
     // the ring shows (never a second store read) plus the folded Readiness, so the sheet can never disagree
     // with the ring. A calibrating night (empty drivers) taps through to the EXISTING calibration countdown.
     @State private var showChargeBreakdown = false
+    // #1727: same idea, the Rest breakdown sheet opened by tapping the hero Rest ring.
+    @State private var showRestBreakdown = false
 
     // S4: the Synthesis card collapses to a single one-liner that expands on tap. Default collapsed so the
     // home screen stays tight; the live content (#506) is unchanged, only the chrome folds. @State (not
@@ -818,6 +826,28 @@ struct TodayView: View {
         // the SAME folded HRV baseline the drivers scored with, so the dot + tier tag in the sheet header
         // agree with the breakdown by construction.
         return (drivers, ScoreConfidence.charge(recovery: row.recovery, hrvBaseline: hrvBase))
+    }
+
+    // MARK: #1727 Rest breakdown drivers (DERIVED from the displayed row, never a second read)
+
+    /// The ordered "What shaped it" Rest drivers for the displayed Rest ring. Reads the resolved
+    /// `sleep_need_hours`/`sleep_consistency` for THIS specific day from `restSeriesByDay` - the SAME
+    /// personal traits that actually scored the night's persisted Rest number - rather than re-deriving
+    /// them from the current trailing history (which could disagree with a past night's actual score).
+    /// nil when there is no resolved Rest series for the day (cold night, or an imported score with no
+    /// NOOP-computed term breakdown to show).
+    ///
+    /// Scope note: unlike `chargeBreakdownRow`, this reads ONLY `displayDay` (today's own row), not a
+    /// carried prior night - Rest's own carry rule lives in `Self.freshRestScore` (a Double, not a row)
+    /// and threading an equivalent "which row backed today's carried Rest number" lookup through here
+    /// safely needs more verification than this pass could give it. A cold/unscored today therefore
+    /// shows no Rest breakdown even when the ring itself still shows a carried number, which is an
+    /// honest "no breakdown for what's shown" rather than a wrong one.
+    private func restBreakdown() -> [RestDriver]? {
+        guard let row = displayDay, let series = restSeriesByDay[row.day] else { return nil }
+        let drivers = AnalyticsEngine.Rest.drivers(daily: row, needHours: series.needHours,
+                                                   consistency: series.consistency)
+        return drivers.isEmpty ? nil : drivers
     }
 
     /// The night's relative skin-temp marker for the displayed row (A5), or nil. Surfaced verbatim from
@@ -1525,6 +1555,9 @@ struct TodayView: View {
         // edited / deleted drink (hydrationSeq) and the Settings feature toggle both re-read just the two
         // hydration fields. Cheap (one metricSeries row), never re-runs the heavy loads.
         .task(id: repo.hydrationSeq) { await reloadHydration() }
+        // #1727: the Rest breakdown's two resolved series, independent of loadDayScoped()'s cached
+        // day-scoped snapshot (see restSeriesByDay's own doc).
+        .task(id: repo.refreshSeq) { await loadRestSeriesByDay() }
         .onChangeCompat(of: hydrationEnabled) { _ in Task { await reloadHydration() } }
         // #755: NO per-edge safety net here, on purpose. A deep offload segments into many slices that each
         // flip `backfilling` false→true, so re-running the heavy history-wide reads on that edge would re-fire
@@ -1583,6 +1616,8 @@ struct TodayView: View {
         // A1 (#514/#706): the Charge breakdown, opened by tapping the Today hero Charge ring. The body
         // builds lazily here (#819 lag) from the drivers DERIVED off the displayed row (never a second read).
         .sheet(isPresented: $showChargeBreakdown) { chargeBreakdownSheet }
+        // #1727: same idea, the Rest breakdown.
+        .sheet(isPresented: $showRestBreakdown) { restBreakdownSheet }
         // Every Today layout/card affordance presents the same draft-based editor. Section-level buttons
         // deep-link to their child page; Cancel/Save semantics and Shown/Hidden rows stay identical.
         .sheet(item: $customizationDestination) { destination in
@@ -2262,6 +2297,92 @@ struct TodayView: View {
         NoopCard(padding: 18, tint: StrandPalette.chargeColor) {
             VStack(alignment: .leading, spacing: NoopMetrics.space2) {
                 Text("No Charge breakdown yet")
+                    .font(StrandFont.headline)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                Text(Self.needsStrapCaption)
+                    .font(StrandFont.subhead)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    // MARK: #1727 Rest breakdown sheet (the Rest-ring tap target)
+
+    /// The sheet opened by tapping the Today hero Rest ring (#1727), mirroring `chargeBreakdownSheet`'s
+    /// own shape. A scored night with a resolved Rest series shows `RestBreakdownSection`; anything else
+    /// (no sleep, or an imported night with no NOOP-computed term breakdown) shows the honest empty note
+    /// rather than a blank sheet.
+    @ViewBuilder
+    private var restBreakdownSheet: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: NoopMetrics.sectionGap) {
+                    if let drivers = restBreakdown() {
+                        NoopCard(padding: 18, tint: StrandPalette.restColor) {
+                            RestBreakdownSection(drivers: drivers)
+                        }
+                    } else {
+                        restBreakdownEmptyNote
+                    }
+                    NavigationLink {
+                        ScoringGuideView(initialSection: .rest, onClose: { showRestBreakdown = false })
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "function")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundStyle(StrandPalette.restColor)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text("How Rest is calculated")
+                                    .font(StrandFont.subhead).foregroundStyle(StrandPalette.textPrimary)
+                                Text("The method behind the score, not today's values.")
+                                    .font(StrandFont.caption).foregroundStyle(StrandPalette.textTertiary)
+                            }
+                            Spacer(minLength: 8)
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundStyle(StrandPalette.textTertiary)
+                        }
+                        .padding(14)
+                        .background(NoopPanelSurface(cornerRadius: 14))
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("How Rest is calculated. The method behind the score.")
+                }
+                .padding(NoopMetrics.screenPadding)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            #if os(iOS)
+            .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+            #endif
+            .background(StrandPalette.surfaceBase.ignoresSafeArea())
+            .navigationTitle("What shaped your Rest")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                #if os(iOS)
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { showRestBreakdown = false }
+                        .foregroundStyle(StrandPalette.accent)
+                }
+                #else
+                ToolbarItem {
+                    Button("Done") { showRestBreakdown = false }
+                        .foregroundStyle(StrandPalette.accent)
+                }
+                #endif
+            }
+        }
+    }
+
+    /// The honest fallback when the Rest ring is tapped but there is no resolved term breakdown for the
+    /// displayed day (no sleep yet, or an imported night the NOOP composite never scored).
+    private var restBreakdownEmptyNote: some View {
+        NoopCard(padding: 18, tint: StrandPalette.restColor) {
+            VStack(alignment: .leading, spacing: NoopMetrics.space2) {
+                Text("No Rest breakdown yet")
                     .font(StrandFont.headline)
                     .foregroundStyle(StrandPalette.textPrimary)
                 Text(Self.needsStrapCaption)
@@ -3169,7 +3290,8 @@ struct TodayView: View {
                 chargeRing(score: score, d: d, diameter: ring)
             }
             heroRingColumn(section: .effort, domain: .effort) { effortRing(d: d, diameter: ring) }
-            heroRingColumn(section: .rest, domain: .rest, provenanceKey: "sleep_performance") { restRing(diameter: ring) }
+            heroRingColumn(section: .rest, domain: .rest, provenanceKey: "sleep_performance",
+                           onRingTap: { showRestBreakdown = true }) { restRing(diameter: ring) }
         }
         .frame(maxWidth: .infinity, alignment: .center)
         // Zero-impact width reader: a clear background that publishes the row's width up via preference. It
@@ -4731,6 +4853,23 @@ struct TodayView: View {
     /// hitch) sits comfortably inside it, and even a genuine load runs up to ~30s behind live anyway (the
     /// Collector flush cadence), so two minutes of cache is the same order of freshness the screen had.
     private static let todayCacheMaxAge: TimeInterval = 120
+
+    /// #1727: load the Rest breakdown's two resolved series (`sleep_need_hours` / `sleep_consistency`)
+    /// into `restSeriesByDay`. Independent of `loadDayScoped()`'s cached day-scoped snapshot on purpose:
+    /// this is a whole-history read (two cheap metricSeries reads, not the heavy HR/hrBuckets reads that
+    /// snapshot exists to avoid), so it can just re-run on every `refreshSeq` bump without needing to
+    /// participate in that cache at all.
+    private func loadRestSeriesByDay() async {
+        async let needA = repo.resolvedSeries(key: "sleep_need_hours", source: Repository.whoopSource)
+        async let consistencyA = repo.resolvedSeries(key: "sleep_consistency", source: Repository.whoopSource)
+        let needByDay = Dictionary(
+            (await needA.values).map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+        let consistencyByDay = Dictionary(
+            (await consistencyA.values).map { ($0.day, $0.value) }, uniquingKeysWith: { _, last in last })
+        restSeriesByDay = needByDay.reduce(into: [:]) { acc, entry in
+            acc[entry.key] = (needHours: entry.value, consistency: consistencyByDay[entry.key])
+        }
+    }
 
     private func loadDayScoped() async {
         // #932: same-state re-mount → restore the prior day-scoped snapshot (no store queries). The exact

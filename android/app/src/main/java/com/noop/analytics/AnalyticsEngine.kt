@@ -1569,6 +1569,42 @@ object RestScorer {
     }
 
     /**
+     * The four raw [0,1] term scores + the deep-adequacy factor + the raw restorative share, computed
+     * ONCE from the raw inputs. Shared by [RestDrivers.drivers] (which weights + rounds these into
+     * points) and [subScoreLine] (which formats them as raw fractions for the diagnostic trace), so the
+     * arithmetic exists in exactly one place and `subScoreLine`'s byte format is unchanged by this
+     * function's existence. Mirrors Swift `AnalyticsEngine.Rest.termScores`.
+     */
+    data class TermScores(
+        val duration: Double,
+        val efficiency: Double,
+        val restorative: Double,
+        val consistency: Double,
+        val deepFactor: Double,
+        val restorativeShare: Double,
+    )
+
+    fun termScores(
+        tstSeconds: Double, efficiency: Double, restorativeSeconds: Double,
+        needHours: Double, consistency: Double?, deepSeconds: Double?,
+    ): TermScores {
+        fun clamp01(x: Double) = maxOf(0.0, minOf(1.0, x))
+        val needSeconds = maxOf(needHours, 0.1) * 3600.0
+        val durationScore = clamp01(tstSeconds / needSeconds)
+        val efficiencyScore = clamp01(efficiency)
+        val deepFactor = if (deepSeconds != null && tstSeconds > 0 && deepShareTarget > 0) {
+            val adequacy = clamp01((deepSeconds / tstSeconds) / deepShareTarget)
+            deepFloorFactor + (1.0 - deepFloorFactor) * adequacy
+        } else 1.0
+        val restorativeShare = if (tstSeconds > 0) restorativeSeconds / tstSeconds else 0.0
+        val restorativeScore = if (tstSeconds > 0)
+            clamp01(restorativeShare / restorativeTargetShare) * deepFactor else 0.0
+        val consistencyScore = clamp01(consistency ?: NEUTRAL_CONSISTENCY)
+        return TermScores(durationScore, efficiencyScore, restorativeScore, consistencyScore,
+            deepFactor, restorativeShare)
+    }
+
+    /**
      * Sleep & Rest test-mode (E11) diagnostic line for the Rest composite. Recomputes the four weighted
      * sub-scores from the SAME inputs `rest()` reads (on the 0..1 scale, byte-aligned with the Swift
      * `Rest.subScoreLine`), and reuses `rest()` for the final `composite=` value so the trace can never
@@ -1581,18 +1617,8 @@ object RestScorer {
         needHours: Double, consistency: Double?, deepSeconds: Double?,
         groupFragments: Int, groupInBedSeconds: Double,
     ): String {
-        fun clamp01(x: Double) = maxOf(0.0, minOf(1.0, x))
         fun r2(x: Double) = Math.round(x * 100.0) / 100.0
-        val needSeconds = maxOf(needHours, 0.1) * 3600.0
-        val durationScore = clamp01(tstSeconds / needSeconds)
-        val efficiencyScore = clamp01(efficiency)
-        val deepFactor = if (deepSeconds != null && tstSeconds > 0 && deepShareTarget > 0) {
-            val adequacy = clamp01((deepSeconds / tstSeconds) / deepShareTarget)
-            deepFloorFactor + (1.0 - deepFloorFactor) * adequacy
-        } else 1.0
-        val restorativeScore = if (tstSeconds > 0)
-            clamp01((restorativeSeconds / tstSeconds) / restorativeTargetShare) * deepFactor else 0.0
-        val consistencyScore = clamp01(consistency ?: NEUTRAL_CONSISTENCY)
+        val t = termScores(tstSeconds, efficiency, restorativeSeconds, needHours, consistency, deepSeconds)
         // Reuse the real scorer for the composite (cannot diverge). `rest()` takes deep + REM separately;
         // restorative = deep + REM, so REM = restorative - deep. null deep -> 0 deep (no-adequacy path).
         val composite = rest(
@@ -1602,10 +1628,10 @@ object RestScorer {
             sleepNeedHours = needHours, consistency = consistency,
         ) ?: 0.0
         return "rest composite=${r2(composite)} " +
-            "dur=${r2(durationScore)}*wDur=$wDuration " +
-            "eff=${r2(efficiencyScore)}*wEff=$wEfficiency " +
-            "restor=${r2(restorativeScore)}*wRestor=$wRestorative deepFactor=${r2(deepFactor)} " +
-            "consist=${r2(consistencyScore)}*wConsist=$wConsistency " +
+            "dur=${r2(t.duration)}*wDur=$wDuration " +
+            "eff=${r2(t.efficiency)}*wEff=$wEfficiency " +
+            "restor=${r2(t.restorative)}*wRestor=$wRestorative deepFactor=${r2(t.deepFactor)} " +
+            "consist=${r2(t.consistency)}*wConsist=$wConsistency " +
             "group=$groupFragments groupInBedMin=${(groupInBedSeconds / 60).toInt()}"
     }
 

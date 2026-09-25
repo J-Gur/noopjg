@@ -2012,6 +2012,15 @@ final class IntelligenceEngine: ObservableObject {
             if let rest = AnalyticsEngine.Rest.composite(daily: daily, needHours: sleepNeedHours,
                                                           consistency: sleepConsistency) {
                 restPoints.append(MetricPoint(day: daily.day, key: "sleep_performance", value: rest))
+                // #1727: persist the EXACT need/consistency that just scored this night, so a later Rest
+                // driver breakdown can rebuild byte-identical rows without re-deriving them from history
+                // (which would drift once trailing nights change). consistency is coalesced to the
+                // composite's own neutral 0.5 default (never omitted): the composite call above already
+                // scored against exactly that value when sleepConsistency is nil, so persisting anything
+                // else would be dishonest.
+                restPoints.append(MetricPoint(day: daily.day, key: "sleep_need_hours", value: sleepNeedHours))
+                restPoints.append(MetricPoint(day: daily.day, key: "sleep_consistency",
+                                              value: sleepConsistency ?? AnalyticsEngine.Rest.neutralConsistency))
             }
             if let onset = physiologicalSteps.onsetByWakeDay[daily.day] {
                 restPoints.append(MetricPoint(day: daily.day,
@@ -2187,6 +2196,9 @@ final class IntelligenceEngine: ObservableObject {
                 if let rest = AnalyticsEngine.Rest.composite(daily: scored, needHours: sleepNeedHours,
                                                               consistency: sleepConsistency) {
                     restPoints.append(MetricPoint(day: w.day, key: "sleep_performance", value: rest))
+                    restPoints.append(MetricPoint(day: w.day, key: "sleep_need_hours", value: sleepNeedHours))
+                    restPoints.append(MetricPoint(day: w.day, key: "sleep_consistency",
+                                                  value: sleepConsistency ?? AnalyticsEngine.Rest.neutralConsistency))
                 }
                 out.append(Computed(day: w.day, recovery: recovery, strain: scored.strain,
                                     sleepMin: scored.totalSleepMin, hrv: scored.avgHrv, rhr: scored.restingHr,

@@ -1788,6 +1788,8 @@ object IntelligenceEngine {
                 // #1727: same real sleepNeedHours/sleepConsistency as the main pass, not the defaults.
                 RestScorer.restFromDaily(scored, sleepNeedHours, sleepConsistency)?.let { rest ->
                     restRows.add(MetricSeriesRow(deviceId = computedId, day = w.day, key = "sleep_performance", value = rest))
+                    restRows.add(MetricSeriesRow(deviceId = computedId, day = w.day, key = "sleep_need_hours", value = sleepNeedHours))
+                    restRows.add(MetricSeriesRow(deviceId = computedId, day = w.day, key = "sleep_consistency", value = sleepConsistency ?: RestScorer.NEUTRAL_CONSISTENCY))
                 }
                 out.add(
                     Computed(
@@ -2247,6 +2249,13 @@ object IntelligenceEngine {
         // `recovery` above was just scored against, not restFromDaily's neutral/flat defaults.
         RestScorer.restFromDaily(daily, sleepNeedHours, sleepConsistency)?.let { rest ->
             restRows.add(MetricSeriesRow(deviceId = computedId, day = daily.day, key = "sleep_performance", value = rest))
+            // #1727: persist the EXACT need/consistency that just scored this night, so a later Rest
+            // driver breakdown can rebuild byte-identical rows without re-deriving them from history (which
+            // would drift once trailing nights change). consistency is coalesced to the composite's own
+            // neutral 0.5 default (never omitted): restFromDaily above already scored against exactly
+            // that value when sleepConsistency is null, so persisting anything else would be dishonest.
+            restRows.add(MetricSeriesRow(deviceId = computedId, day = daily.day, key = "sleep_need_hours", value = sleepNeedHours))
+            restRows.add(MetricSeriesRow(deviceId = computedId, day = daily.day, key = "sleep_consistency", value = sleepConsistency ?: RestScorer.NEUTRAL_CONSISTENCY))
         }
         return recovery
     }

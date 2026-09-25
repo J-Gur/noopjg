@@ -107,31 +107,25 @@ extension AnalyticsEngine.Rest {
                                     restorativeSeconds: Double, needHours: Double,
                                     consistency: Double?, deepSeconds: Double?,
                                     groupFragments: Int, groupInBedSeconds: Double) -> String {
-        func clamp01(_ x: Double) -> Double { max(0.0, min(1.0, x)) }
         func r2(_ x: Double) -> Double { (x * 100.0).rounded() / 100.0 }
 
-        let needSeconds = max(needHours, 0.1) * 3600.0
-        let durationScore = clamp01(tstSeconds / needSeconds)
-        let efficiencyScore = clamp01(efficiency)
-        let deepFactor: Double = {
-            guard let deep = deepSeconds, tstSeconds > 0, deepShareTarget > 0 else { return 1.0 }
-            let adequacy = clamp01((deep / tstSeconds) / deepShareTarget)
-            return deepFloorFactor + (1.0 - deepFloorFactor) * adequacy
-        }()
-        let restorativeScore = tstSeconds > 0
-            ? clamp01((restorativeSeconds / tstSeconds) / restorativeTarget) * deepFactor
-            : 0.0
-        let consistencyScore = clamp01(consistency ?? neutralConsistency)
+        // #1727: the four raw term scores now come from the SAME termScores(...) `drivers(...)` uses
+        // (RestDrivers.swift), rather than a second inline computation - this line's byte format is
+        // otherwise unchanged.
+        let t = AnalyticsEngine.Rest.termScores(tstSeconds: tstSeconds, efficiency: efficiency,
+                                                restorativeSeconds: restorativeSeconds,
+                                                needHours: needHours, consistency: consistency,
+                                                deepSeconds: deepSeconds)
         let composite = AnalyticsEngine.Rest.composite(
             tstSeconds: tstSeconds, inBedSeconds: inBedSeconds, efficiency: efficiency,
             restorativeSeconds: restorativeSeconds, needHours: needHours,
             consistency: consistency, deepSeconds: deepSeconds)
 
         return "rest composite=\(r2(composite)) "
-            + "dur=\(r2(durationScore))*wDur=\(wDuration) "
-            + "eff=\(r2(efficiencyScore))*wEff=\(wEfficiency) "
-            + "restor=\(r2(restorativeScore))*wRestor=\(wRestorative) deepFactor=\(r2(deepFactor)) "
-            + "consist=\(r2(consistencyScore))*wConsist=\(wConsistency) "
+            + "dur=\(r2(t.duration))*wDur=\(wDuration) "
+            + "eff=\(r2(t.efficiency))*wEff=\(wEfficiency) "
+            + "restor=\(r2(t.restorative))*wRestor=\(wRestorative) deepFactor=\(r2(t.deepFactor)) "
+            + "consist=\(r2(t.consistency))*wConsist=\(wConsistency) "
             + "group=\(groupFragments) groupInBedMin=\(Int(groupInBedSeconds / 60))"
     }
 }
