@@ -4,9 +4,10 @@ import com.noop.R
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.interaction.InteractionSource
-import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.height
@@ -23,6 +24,7 @@ import androidx.compose.ui.composed
 import androidx.compose.ui.graphics.Color
 import android.view.HapticFeedbackConstants
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.TextStyle
@@ -109,15 +111,23 @@ fun LiquidVessel(
         Canvas(
             modifier = modifier
                 .aspectRatio(1f)
-                .clickable(
-                    indication = null,
-                    interactionSource = remember { MutableInteractionSource() },
-                ) {
-                    sim.splash(12)
-                    // A LIGHT tap impact, matching iOS `.sensoryFeedback(.impact(weight: .light))`. Compose's
-                    // HapticFeedbackType on this BOM only offers LongPress (heavy) / TextHandleMove, so route a
-                    // light KEYBOARD_TAP through the platform view — the closest available light-impact tick.
-                    view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                // The splash listens WITHOUT consuming. This used to be a `.clickable`, which as the innermost
+                // clickable took every tap for itself, so a tappable parent (the Today Charge ring, the Coupled
+                // hero and Rest cards) never saw it and its onClick was dead whenever the vessel animated.
+                // Observing the tap and leaving it unconsumed lets the parent's own click, press feedback and
+                // semantics work as they do around any other child. A gesture that turns into a scroll or drag
+                // cancels here (waitForUpOrCancellation returns null), so scrolling past a vessel stays quiet.
+                .pointerInput(sim, view) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false)
+                        if (waitForUpOrCancellation() != null) {
+                            sim.splash(12)
+                            // A LIGHT tap impact, matching iOS `.sensoryFeedback(.impact(weight: .light))`. Compose's
+                            // HapticFeedbackType on this BOM only offers LongPress (heavy) / TextHandleMove, so route a
+                            // light KEYBOARD_TAP through the platform view — the closest available light-impact tick.
+                            view.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                        }
+                    }
                 },
         ) {
             sim.step(now = seconds, tilt = LiquidMotion.shared.tilt, target = value ?: 0.0)
