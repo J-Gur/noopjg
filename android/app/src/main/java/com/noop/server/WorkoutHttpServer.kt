@@ -49,6 +49,12 @@ class WorkoutHttpServer(port: Int = PORT) : NanoHTTPD(port) {
     }
 
     private fun handleStart(session: IHTTPSession): Response {
+        // TEMPORARY DEBUG (remove once the per-button reports are explained): routed through the
+        // in-app debug log (Settings -> Strap -> Debug logging) instead of adb, so it's visible without
+        // a USB connection. Logs the state BEFORE the call so a silent no-op — startWorkout()'s own
+        // `if (_activeWorkout.value != null) return` guard — is directly visible: if "before" already
+        // shows a DIFFERENT sport active, this tap can never have done anything, no matter what /workouts
+        // shows afterward (it still shows the ORIGINAL sport's "in progress", which reads as unrelated).
         val vm = ActiveAppViewModel.current ?: return unavailable()
         val param = session.parms["type"].orEmpty()
         val button = BUTTONS.firstOrNull { it.param.equals(param, ignoreCase = true) }
@@ -57,6 +63,9 @@ class WorkoutHttpServer(port: Int = PORT) : NanoHTTPD(port) {
         // must surface as an error, never quietly log the workout under "Other".
         val sport = WorkoutSport.all.firstOrNull { it.name == button.catalogName }
             ?: return textResponse(Response.Status.BAD_REQUEST, "Sport '${button.catalogName}' not found in catalog")
+        vm.ble.externalLog(
+            "WebDashboard /start: requested=${sport.name} activeBEFORE=${vm.activeWorkout.value}",
+        )
         // startWorkout/endWorkout mutate ViewModel StateFlows that the rest of the app assumes change
         // on the main thread (mirroring every other call site, which is Compose UI). NanoHTTPD calls
         // serve() on its own per-request worker thread, so hop over rather than mutate cross-thread;
@@ -66,18 +75,26 @@ class WorkoutHttpServer(port: Int = PORT) : NanoHTTPD(port) {
         try {
             runBlocking(Dispatchers.Main.immediate) { vm.startWorkout(sport, gpsEnabled = false) }
         } catch (e: Exception) {
+            vm.ble.externalLog("WebDashboard /start: startWorkout() threw ${e::class.simpleName}: ${e.message}")
             return textResponse(Response.Status.INTERNAL_ERROR, "startWorkout() threw: ${e.message}")
         }
+        vm.ble.externalLog("WebDashboard /start: activeAFTER=${vm.activeWorkout.value}")
         return redirectTo("/workouts")
     }
 
     private fun handleStop(): Response {
+        // TEMPORARY DEBUG (remove once the per-button reports are explained): same in-app log as
+        // handleStart. Answers directly: does the request arrive, does ActiveAppViewModel.current
+        // resolve, and does the active workout actually clear.
         val vm = ActiveAppViewModel.current ?: return unavailable()
+        vm.ble.externalLog("WebDashboard /stop: activeBEFORE=${vm.activeWorkout.value}")
         try {
             runBlocking(Dispatchers.Main.immediate) { vm.endWorkout() }
         } catch (e: Exception) {
+            vm.ble.externalLog("WebDashboard /stop: endWorkout() threw ${e::class.simpleName}: ${e.message}")
             return textResponse(Response.Status.INTERNAL_ERROR, "endWorkout() threw: ${e.message}")
         }
+        vm.ble.externalLog("WebDashboard /stop: activeAFTER=${vm.activeWorkout.value}")
         return redirectTo("/workouts")
     }
 
@@ -98,7 +115,25 @@ class WorkoutHttpServer(port: Int = PORT) : NanoHTTPD(port) {
      * with zero friction just because it can reach the port.
      */
     private fun handleSteps(session: IHTTPSession): Response {
+        // TEMPORARY DEBUG (remove once "/steps doesn't load at all" is explained): mirrors handleStart/
+        // handleStop's own wrapping (see their comments) — an uncaught throw anywhere in this function
+        // would otherwise surface to the browser/Shortcut as a silently dropped connection with no
+        // response at all, which is indistinguishable from "the request never arrived." Wrapping the
+        // WHOLE function (not just the final write, as before) turns that into a real 500 response plus
+        // a line in Settings -> Strap -> Debug logging, so a throw becomes observable instead of mute.
+        return try {
+            handleStepsInner(session)
+        } catch (e: Exception) {
+            ActiveAppViewModel.current?.ble?.externalLog(
+                "WebDashboard /steps: threw ${e::class.simpleName}: ${e.message}",
+            )
+            textResponse(Response.Status.INTERNAL_ERROR, "handleSteps() threw: ${e::class.simpleName}: ${e.message}")
+        }
+    }
+
+    private fun handleStepsInner(session: IHTTPSession): Response {
         val vm = ActiveAppViewModel.current ?: return unavailable()
+        vm.ble.externalLog("WebDashboard /steps: parms=${session.parms}")
         val puffin = PuffinExperiment.from(vm.getApplication())
         if (!puffin.manualHttpSteps) {
             return textResponse(
