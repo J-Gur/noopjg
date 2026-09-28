@@ -9,13 +9,18 @@ import com.noop.analytics.FitnessAgeEngine
 import com.noop.analytics.FitnessAgeResult
 import com.noop.analytics.RecoveryDrivers
 import com.noop.analytics.RestScorer
+import com.noop.analytics.StrainScorer
 import com.noop.data.DailyMetric
 import com.noop.data.SleepSession
 import com.noop.data.WorkoutRow
 import com.noop.ui.AppViewModel
+import com.noop.ui.DisplayText
+import com.noop.ui.NoopPrefs
 import com.noop.ui.PersistedSegment
 import com.noop.ui.ProfileStore
 import com.noop.ui.VitalReading
+import com.noop.ui.carriedCaption
+import com.noop.ui.lastScoredRecoveryDay
 import com.noop.ui.mergeReadings
 import com.noop.ui.mergeStepsReadings
 import com.noop.ui.parsePersistedSegments
@@ -55,16 +60,89 @@ internal enum class Tab(val route: String, val label: String) {
 // Pages
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 
+/** [todayPage]'s resolved read-outs — the same shape [buildRecoveryDrivers]/[recoveryRingSvg]/[statTile]
+ *  need, computed together in one IO pass so the carry-over and live-blend logic below share the [days]
+ *  history query instead of fetching it twice. */
+private data class TodayResolved(
+    val drivers: List<ChargeDriver>,
+    val recovery: Double?,
+    val recoveryCarryCaption: String?,
+    val strain: Double?,
+)
+
+/** Resolves a [DisplayText] to a plain string outside Compose — the non-composable twin of
+ *  `TodayScreen.kt`'s private `DisplayText.localized()`, which can't be called from here (different
+ *  package, and `@Composable`). [com.noop.ui.uiString] itself is already a plain function, so this is
+ *  just the same `when` without the Compose requirement. */
+private fun displayTextString(text: DisplayText): String = when (text) {
+    is DisplayText.Resource -> com.noop.ui.uiString(text.id, *text.args.toTypedArray())
+    is DisplayText.Dynamic -> text.value
+}
+
 internal fun todayPage(vm: AppViewModel): String {
     val today = vm.today.value
-    val drivers = runBlocking(Dispatchers.IO) {
-        today?.let { buildRecoveryDrivers(it, vm.repo.daysMerged(vm.activeStrapId)) } ?: emptyList()
+    val context = vm.getApplication<android.app.Application>()
+    val resolved = runBlocking(Dispatchers.IO) {
+        val days = vm.repo.daysMerged(vm.activeStrapId)
+        val drivers = today?.let { buildRecoveryDrivers(it, days) } ?: emptyList()
+
+        // Recovery carry-over — mirrors TodayScreen.kt's lastScoredCharge: while tonight's recovery
+        // hasn't been scored yet (right after the logical-day rollover, or on freshly-imported data),
+        // show the most recent PRIOR scored night instead of a bare blank, the same "Last night ·
+        // <date>" fallback every recovery-derived readout on the native screen carries. Without it the
+        // whole recovery side reads as broken instead of just "not scored yet". Deliberately narrower
+        // than the native screen in one respect: the calibration-progress display ("N of 4 nights") is
+        // a separate feature and not replicated here, so a mid-calibration today is treated the same as
+        // any other today with no recovery — [isCalibrating] is always false.
+        val todayKey = today?.day ?: java.time.LocalDate.now().toString()
+        val priorScored = lastScoredRecoveryDay(
+            days = days,
+            selectedDayKey = todayKey,
+            isToday = true,
+            todayScored = today?.recovery != null,
+            isCalibrating = false,
+            today = todayKey,
+        )
+        val recovery = today?.recovery ?: priorScored?.recovery
+        val recoveryCarryCaption = if (today?.recovery == null && priorScored != null) {
+            displayTextString(carriedCaption(priorScored.day, todayKey))
+        } else {
+            null
+        }
+
+        // Live strain blend — mirrors TodayScreen.kt's effectiveEffort: `today.strain` only refreshes
+        // when the heavy daily pass runs, so early in the day it holds a stale 0.0 (or yesterday's
+        // value) instead of what's actually accrued. Integrate today's raw HR the same way the native
+        // live-Effort path does and take the max with the stored value (Effort must never visibly
+        // drop). Simplification vs the native screen: always uses calendar midnight as the day
+        // boundary, not the sleep-onset-aware DayCycleMode.SLEEP_ONSET boundary — replicating that would
+        // need a third data source (onset markers) purely to decide "when did today start" for a
+        // read-only snapshot page.
+        val zone = java.time.ZoneId.systemDefault()
+        val nowS = System.currentTimeMillis() / 1000
+        val dayStartS = java.time.LocalDate.now(zone).atStartOfDay(zone).toEpochSecond()
+        val todayHr = runCatching { vm.repo.hrSamplesUnion(vm.activeStrapId, dayStartS, nowS) }
+            .getOrDefault(emptyList())
+        val profile = ProfileStore.from(context)
+        val effMaxHR = profile.hrMaxOverride.takeIf { it > 0 }?.toDouble()
+            ?: if (profile.age > 0) StrainScorer.tanakaHRmax(profile.age.toDouble()) else null
+        val restingHr = today?.restingHr?.toDouble() ?: StrainScorer.defaultRestingHR
+        val liveStrain = StrainScorer.strain(
+            hr = todayHr,
+            maxHR = effMaxHR,
+            restingHR = restingHr,
+            method = NoopPrefs.effortMethod(context),
+            sex = profile.sex,
+        )
+        val strain = StrainScorer.effectiveEffort(live = liveStrain, stored = today?.strain)
+
+        TodayResolved(drivers, recovery, recoveryCarryCaption, strain)
     }
-    val driversHtml = if (drivers.isNotEmpty()) {
+    val driversHtml = if (resolved.drivers.isNotEmpty()) {
         """
         <div class="section-label">What Shaped It</div>
         <div class="card">
-          ${drivers.joinToString("\n") { driverRowHtml(it) }}
+          ${resolved.drivers.joinToString("\n") { driverRowHtml(it) }}
         </div>
         """.trimIndent()
     } else {
@@ -74,11 +152,12 @@ internal fun todayPage(vm: AppViewModel): String {
         <div class="header"><h1>Today</h1></div>
 
         <div class="ring-section">
-          ${recoveryRingSvg(today?.recovery)}
+          ${recoveryRingSvg(resolved.recovery)}
+          ${resolved.recoveryCarryCaption?.let { "<div class=\"ring-caption\">$it</div>" } ?: ""}
         </div>
 
         <div class="tile-grid">
-          ${statTile("Strain", today?.strain?.let { "%.1f".format(it) }, "effort")}
+          ${statTile("Strain", resolved.strain?.let { "%.1f".format(it) }, "effort")}
           ${statTile("Resting HR", today?.restingHr?.let { "$it bpm" })}
         </div>
 
